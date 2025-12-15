@@ -18,12 +18,13 @@ static class Program
 #region Settings
 
 public enum DockPosition { Top, Bottom }
+public enum MonitorMode { Single, All }
 
 public class AppSettings
 {
-    public bool MultiMonitor { get; set; } = false;
+    public MonitorMode MonitorMode { get; set; } = MonitorMode.Single;
     public int MonitorIndex { get; set; } = 0;
-    public int BarHeight { get; set; } = 30;
+    public int BarHeight { get; set; } = 40;
     public DockPosition DockPosition { get; set; } = DockPosition.Top;
 
     private static readonly string SettingsDir = Path.Combine(
@@ -54,16 +55,173 @@ public class AppSettings
         }
         catch { }
     }
+}
 
-    public static void OpenSettingsFolder()
+#endregion
+
+#region Settings Dialog
+
+public class SettingsDialog : Form
+{
+    private readonly AppSettings _settings;
+    private readonly ComboBox _monitorModeCombo;
+    private readonly ComboBox _monitorSelectCombo;
+    private readonly ComboBox _dockPositionCombo;
+    private readonly NumericUpDown _barHeightNumeric;
+    private readonly Button _saveButton;
+    private readonly Button _cancelButton;
+
+    public bool SettingsChanged { get; private set; }
+
+    public SettingsDialog(AppSettings settings)
     {
-        Directory.CreateDirectory(SettingsDir);
-        // Create default settings if none exist
-        if (!File.Exists(SettingsPath))
+        _settings = settings;
+
+        Text = "Address Bar Settings";
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = false;
+        MinimizeBox = false;
+        StartPosition = FormStartPosition.CenterScreen;
+        Size = new Size(350, 220);
+        BackColor = IsDarkMode() ? Color.FromArgb(32, 32, 32) : SystemColors.Control;
+        ForeColor = IsDarkMode() ? Color.White : SystemColors.ControlText;
+
+        var labelFont = new Font("Segoe UI", 9f);
+        int y = 15;
+        int labelX = 15;
+        int controlX = 140;
+        int controlWidth = 180;
+        int rowHeight = 32;
+
+        // Monitor Mode
+        var modeLabel = new Label { Text = "Monitor:", Location = new Point(labelX, y + 3), AutoSize = true, Font = labelFont };
+        _monitorModeCombo = new ComboBox
         {
-            new AppSettings().Save();
+            Location = new Point(controlX, y),
+            Width = controlWidth,
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Font = labelFont
+        };
+        _monitorModeCombo.Items.AddRange(new object[] { "Single Monitor", "All Monitors" });
+        _monitorModeCombo.SelectedIndex = _settings.MonitorMode == MonitorMode.All ? 1 : 0;
+        _monitorModeCombo.SelectedIndexChanged += (s, e) => UpdateMonitorSelectEnabled();
+        Controls.Add(modeLabel);
+        Controls.Add(_monitorModeCombo);
+        y += rowHeight;
+
+        // Monitor Selection
+        var selectLabel = new Label { Text = "Display:", Location = new Point(labelX, y + 3), AutoSize = true, Font = labelFont };
+        _monitorSelectCombo = new ComboBox
+        {
+            Location = new Point(controlX, y),
+            Width = controlWidth,
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Font = labelFont
+        };
+        for (int i = 0; i < Screen.AllScreens.Length; i++)
+        {
+            var screen = Screen.AllScreens[i];
+            _monitorSelectCombo.Items.Add($"Monitor {i + 1}{(screen.Primary ? " (Primary)" : "")}");
         }
-        Process.Start(new ProcessStartInfo("explorer.exe", $"\"{SettingsDir}\"") { UseShellExecute = true });
+        _monitorSelectCombo.SelectedIndex = Math.Min(_settings.MonitorIndex, Screen.AllScreens.Length - 1);
+        Controls.Add(selectLabel);
+        Controls.Add(_monitorSelectCombo);
+        y += rowHeight;
+
+        // Dock Position
+        var dockLabel = new Label { Text = "Dock Position:", Location = new Point(labelX, y + 3), AutoSize = true, Font = labelFont };
+        _dockPositionCombo = new ComboBox
+        {
+            Location = new Point(controlX, y),
+            Width = controlWidth,
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Font = labelFont
+        };
+        _dockPositionCombo.Items.AddRange(new object[] { "Top", "Bottom" });
+        _dockPositionCombo.SelectedIndex = _settings.DockPosition == DockPosition.Bottom ? 1 : 0;
+        Controls.Add(dockLabel);
+        Controls.Add(_dockPositionCombo);
+        y += rowHeight;
+
+        // Bar Height
+        var heightLabel = new Label { Text = "Bar Height:", Location = new Point(labelX, y + 3), AutoSize = true, Font = labelFont };
+        _barHeightNumeric = new NumericUpDown
+        {
+            Location = new Point(controlX, y),
+            Width = 80,
+            Minimum = 20,
+            Maximum = 60,
+            Value = _settings.BarHeight,
+            Font = labelFont
+        };
+        Controls.Add(heightLabel);
+        Controls.Add(_barHeightNumeric);
+        y += rowHeight + 10;
+
+        // Buttons
+        _saveButton = new Button
+        {
+            Text = "Save",
+            Location = new Point(controlX, y),
+            Width = 80,
+            Font = labelFont,
+            DialogResult = DialogResult.OK
+        };
+        _saveButton.Click += SaveButton_Click;
+
+        _cancelButton = new Button
+        {
+            Text = "Cancel",
+            Location = new Point(controlX + 90, y),
+            Width = 80,
+            Font = labelFont,
+            DialogResult = DialogResult.Cancel
+        };
+
+        Controls.Add(_saveButton);
+        Controls.Add(_cancelButton);
+
+        AcceptButton = _saveButton;
+        CancelButton = _cancelButton;
+
+        UpdateMonitorSelectEnabled();
+    }
+
+    private void UpdateMonitorSelectEnabled()
+    {
+        _monitorSelectCombo.Enabled = _monitorModeCombo.SelectedIndex == 0;
+    }
+
+    private void SaveButton_Click(object? sender, EventArgs e)
+    {
+        var newMode = _monitorModeCombo.SelectedIndex == 1 ? MonitorMode.All : MonitorMode.Single;
+        var newMonitorIndex = _monitorSelectCombo.SelectedIndex;
+        var newDockPosition = _dockPositionCombo.SelectedIndex == 1 ? DockPosition.Bottom : DockPosition.Top;
+        var newBarHeight = (int)_barHeightNumeric.Value;
+
+        if (newMode != _settings.MonitorMode ||
+            newMonitorIndex != _settings.MonitorIndex ||
+            newDockPosition != _settings.DockPosition ||
+            newBarHeight != _settings.BarHeight)
+        {
+            _settings.MonitorMode = newMode;
+            _settings.MonitorIndex = newMonitorIndex;
+            _settings.DockPosition = newDockPosition;
+            _settings.BarHeight = newBarHeight;
+            _settings.Save();
+            SettingsChanged = true;
+        }
+    }
+
+    private static bool IsDarkMode()
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+            var value = key?.GetValue("AppsUseLightTheme");
+            return value is int i && i == 0;
+        }
+        catch { return false; }
     }
 }
 
@@ -83,7 +241,7 @@ public class AddressBarManager : ApplicationContext
 
         _trayIcon = new NotifyIcon
         {
-            Icon = SystemIcons.Application,
+            Icon = LoadAppIcon(),
             Text = "Address Bar",
             Visible = true
         };
@@ -91,9 +249,14 @@ public class AddressBarManager : ApplicationContext
         BuildContextMenu();
         _trayIcon.DoubleClick += (s, e) => ShowAllBars();
 
-        SystemEvents.DisplaySettingsChanged += (s, e) => RecreateAppBars();
+        SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
 
         CreateAppBars();
+    }
+
+    private void OnDisplaySettingsChanged(object? sender, EventArgs e)
+    {
+        RecreateAppBars();
     }
 
     private void BuildContextMenu()
@@ -102,80 +265,29 @@ public class AddressBarManager : ApplicationContext
         contextMenu.Items.Add("Show", null, (s, e) => ShowAllBars());
         contextMenu.Items.Add("Hide", null, (s, e) => HideAllBars());
         contextMenu.Items.Add("-");
-
-        // Monitor submenu
-        var monitorMenu = new ToolStripMenuItem("Monitor");
-        var multiItem = new ToolStripMenuItem("All Monitors")
-        {
-            Checked = _settings.MultiMonitor
-        };
-        multiItem.Click += (s, e) =>
-        {
-            _settings.MultiMonitor = true;
-            _settings.Save();
-            RecreateAppBars();
-            BuildContextMenu();
-        };
-        monitorMenu.DropDownItems.Add(multiItem);
-        monitorMenu.DropDownItems.Add("-");
-
-        for (int i = 0; i < Screen.AllScreens.Length; i++)
-        {
-            var screen = Screen.AllScreens[i];
-            var idx = i;
-            var item = new ToolStripMenuItem($"Monitor {i + 1}{(screen.Primary ? " (Primary)" : "")}")
-            {
-                Checked = !_settings.MultiMonitor && _settings.MonitorIndex == i
-            };
-            item.Click += (s, e) =>
-            {
-                _settings.MultiMonitor = false;
-                _settings.MonitorIndex = idx;
-                _settings.Save();
-                RecreateAppBars();
-                BuildContextMenu();
-            };
-            monitorMenu.DropDownItems.Add(item);
-        }
-        contextMenu.Items.Add(monitorMenu);
-
-        // Dock position submenu
-        var dockMenu = new ToolStripMenuItem("Dock Position");
-        var topItem = new ToolStripMenuItem("Top") { Checked = _settings.DockPosition == DockPosition.Top };
-        topItem.Click += (s, e) =>
-        {
-            _settings.DockPosition = DockPosition.Top;
-            _settings.Save();
-            RecreateAppBars();
-            BuildContextMenu();
-        };
-        var bottomItem = new ToolStripMenuItem("Bottom") { Checked = _settings.DockPosition == DockPosition.Bottom };
-        bottomItem.Click += (s, e) =>
-        {
-            _settings.DockPosition = DockPosition.Bottom;
-            _settings.Save();
-            RecreateAppBars();
-            BuildContextMenu();
-        };
-        dockMenu.DropDownItems.Add(topItem);
-        dockMenu.DropDownItems.Add(bottomItem);
-        contextMenu.Items.Add(dockMenu);
-
-        contextMenu.Items.Add("-");
-        contextMenu.Items.Add("Settings Folder", null, (s, e) => AppSettings.OpenSettingsFolder());
+        contextMenu.Items.Add("Settings...", null, (s, e) => ShowSettings());
         contextMenu.Items.Add("-");
         contextMenu.Items.Add("Exit", null, (s, e) => Exit());
 
         _trayIcon.ContextMenuStrip = contextMenu;
     }
 
+    public void ShowSettings()
+    {
+        using var dialog = new SettingsDialog(_settings);
+        if (dialog.ShowDialog() == DialogResult.OK && dialog.SettingsChanged)
+        {
+            RecreateAppBars();
+        }
+    }
+
     private void CreateAppBars()
     {
-        if (_settings.MultiMonitor)
+        if (_settings.MonitorMode == MonitorMode.All)
         {
             foreach (var screen in Screen.AllScreens)
             {
-                var bar = new AddressBarForm(screen, _settings);
+                var bar = new AddressBarForm(screen, _settings, this);
                 bar.Show();
                 _bars.Add(bar);
             }
@@ -186,7 +298,7 @@ public class AddressBarManager : ApplicationContext
             var targetScreen = _settings.MonitorIndex < screens.Length
                 ? screens[_settings.MonitorIndex]
                 : Screen.PrimaryScreen!;
-            var bar = new AddressBarForm(targetScreen, _settings);
+            var bar = new AddressBarForm(targetScreen, _settings, this);
             bar.Show();
             _bars.Add(bar);
         }
@@ -229,8 +341,21 @@ public class AddressBarManager : ApplicationContext
         }
         _trayIcon.Visible = false;
         _trayIcon.Dispose();
-        SystemEvents.DisplaySettingsChanged -= (s, e) => RecreateAppBars();
+        SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
         Application.Exit();
+    }
+
+    private static Icon LoadAppIcon()
+    {
+        try
+        {
+            var exePath = System.Reflection.Assembly.GetExecutingAssembly().Location;
+            var iconPath = Path.Combine(Path.GetDirectoryName(exePath)!, "addressbar.ico");
+            if (File.Exists(iconPath))
+                return new Icon(iconPath);
+        }
+        catch { }
+        return SystemIcons.Application;
     }
 }
 
@@ -295,6 +420,7 @@ public class AddressBarForm : Form
 
     private readonly Screen _screen;
     private readonly AppSettings _settings;
+    private readonly AddressBarManager _manager;
     private int _appBarHeight;
     private uint _callbackMessageId;
     private bool _appBarRegistered;
@@ -302,12 +428,14 @@ public class AddressBarForm : Form
 
     private readonly TextBox _addressBox;
     private readonly Button _goButton;
+    private readonly Button _settingsButton;
     private readonly Label _addressLabel;
 
-    public AddressBarForm(Screen screen, AppSettings settings)
+    public AddressBarForm(Screen screen, AppSettings settings, AddressBarManager manager)
     {
         _screen = screen;
         _settings = settings;
+        _manager = manager;
 
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
@@ -351,9 +479,24 @@ public class AddressBarForm : Form
         _goButton.FlatAppearance.BorderColor = GetBorderColor();
         _goButton.Click += GoButton_Click;
 
+        _settingsButton = new Button
+        {
+            Text = "⚙",
+            FlatStyle = FlatStyle.Flat,
+            Font = new Font("Segoe UI", 9f),
+            BackColor = GetButtonBackColor(),
+            ForeColor = GetSystemForeColor(),
+            Cursor = Cursors.Hand,
+            Width = LogicalToDeviceUnits(30)
+        };
+        _settingsButton.FlatAppearance.BorderSize = 1;
+        _settingsButton.FlatAppearance.BorderColor = GetBorderColor();
+        _settingsButton.Click += SettingsButton_Click;
+
         Controls.Add(_addressLabel);
         Controls.Add(_addressBox);
         Controls.Add(_goButton);
+        Controls.Add(_settingsButton);
 
         SystemEvents.UserPreferenceChanged += SystemEvents_UserPreferenceChanged;
 
@@ -378,16 +521,20 @@ public class AddressBarForm : Form
         int padding = LogicalToDeviceUnits(6);
         int labelWidth = LogicalToDeviceUnits(50);
         int buttonWidth = _goButton.Width;
+        int settingsWidth = _settingsButton.Width;
 
         _addressLabel.Location = new Point(padding, (Height - _addressLabel.Height) / 2);
 
         int textBoxLeft = padding + labelWidth;
-        int textBoxWidth = Width - textBoxLeft - buttonWidth - padding * 2;
+        int textBoxWidth = Width - textBoxLeft - buttonWidth - settingsWidth - padding * 3;
         _addressBox.Location = new Point(textBoxLeft, (Height - _addressBox.Height) / 2);
         _addressBox.Width = textBoxWidth;
 
-        _goButton.Location = new Point(Width - buttonWidth - padding, (Height - _goButton.Height) / 2);
+        _goButton.Location = new Point(Width - buttonWidth - settingsWidth - padding * 2, (Height - _goButton.Height) / 2);
         _goButton.Height = _addressBox.Height;
+
+        _settingsButton.Location = new Point(Width - settingsWidth - padding, (Height - _settingsButton.Height) / 2);
+        _settingsButton.Height = _addressBox.Height;
     }
 
     #region AppBar Registration
@@ -555,6 +702,11 @@ public class AddressBarForm : Form
         Navigate();
     }
 
+    private void SettingsButton_Click(object? sender, EventArgs e)
+    {
+        _manager.ShowSettings();
+    }
+
     private void Navigate()
     {
         string input = _addressBox.Text.Trim();
@@ -659,6 +811,9 @@ public class AddressBarForm : Form
         _goButton.BackColor = GetButtonBackColor();
         _goButton.ForeColor = GetSystemForeColor();
         _goButton.FlatAppearance.BorderColor = GetBorderColor();
+        _settingsButton.BackColor = GetButtonBackColor();
+        _settingsButton.ForeColor = GetSystemForeColor();
+        _settingsButton.FlatAppearance.BorderColor = GetBorderColor();
         ApplyDarkMode();
         Invalidate();
     }

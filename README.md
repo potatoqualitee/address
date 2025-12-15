@@ -46,7 +46,7 @@ Settings are stored in `%APPDATA%\AddressBar\settings.json`:
 {
   "MultiMonitor": false,
   "MonitorIndex": 0,
-  "BarHeight": 30,
+  "BarHeight": 40,
   "DockPosition": "Top"
 }
 ```
@@ -55,7 +55,7 @@ Settings are stored in `%APPDATA%\AddressBar\settings.json`:
 |---------|-------------|---------|
 | `MultiMonitor` | Show address bar on all monitors | `false` |
 | `MonitorIndex` | Which monitor to dock to (0 = primary, 1 = second, etc.) | `0` |
-| `BarHeight` | Height of the address bar in pixels | `30` |
+| `BarHeight` | Height of the address bar in pixels | `40` |
 | `DockPosition` | Where to dock: `Top` or `Bottom` | `Top` |
 
 ## Usage
