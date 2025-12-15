@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text.Json;
 using Microsoft.Win32;
 
 namespace AddressBar;
@@ -10,9 +11,230 @@ static class Program
     static void Main()
     {
         ApplicationConfiguration.Initialize();
-        Application.Run(new AddressBarForm());
+        Application.Run(new AddressBarManager());
     }
 }
+
+#region Settings
+
+public enum DockPosition { Top, Bottom }
+
+public class AppSettings
+{
+    public bool MultiMonitor { get; set; } = false;
+    public int MonitorIndex { get; set; } = 0;
+    public int BarHeight { get; set; } = 30;
+    public DockPosition DockPosition { get; set; } = DockPosition.Top;
+
+    private static readonly string SettingsDir = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AddressBar");
+    private static readonly string SettingsPath = Path.Combine(SettingsDir, "settings.json");
+
+    public static AppSettings Load()
+    {
+        try
+        {
+            if (File.Exists(SettingsPath))
+            {
+                var json = File.ReadAllText(SettingsPath);
+                return JsonSerializer.Deserialize<AppSettings>(json) ?? new AppSettings();
+            }
+        }
+        catch { }
+        return new AppSettings();
+    }
+
+    public void Save()
+    {
+        try
+        {
+            Directory.CreateDirectory(SettingsDir);
+            var json = JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(SettingsPath, json);
+        }
+        catch { }
+    }
+
+    public static void OpenSettingsFolder()
+    {
+        Directory.CreateDirectory(SettingsDir);
+        // Create default settings if none exist
+        if (!File.Exists(SettingsPath))
+        {
+            new AppSettings().Save();
+        }
+        Process.Start(new ProcessStartInfo("explorer.exe", $"\"{SettingsDir}\"") { UseShellExecute = true });
+    }
+}
+
+#endregion
+
+#region Manager (handles multiple bars)
+
+public class AddressBarManager : ApplicationContext
+{
+    private readonly List<AddressBarForm> _bars = new();
+    private readonly NotifyIcon _trayIcon;
+    private AppSettings _settings;
+
+    public AddressBarManager()
+    {
+        _settings = AppSettings.Load();
+
+        _trayIcon = new NotifyIcon
+        {
+            Icon = SystemIcons.Application,
+            Text = "Address Bar",
+            Visible = true
+        };
+
+        BuildContextMenu();
+        _trayIcon.DoubleClick += (s, e) => ShowAllBars();
+
+        SystemEvents.DisplaySettingsChanged += (s, e) => RecreateAppBars();
+
+        CreateAppBars();
+    }
+
+    private void BuildContextMenu()
+    {
+        var contextMenu = new ContextMenuStrip();
+        contextMenu.Items.Add("Show", null, (s, e) => ShowAllBars());
+        contextMenu.Items.Add("Hide", null, (s, e) => HideAllBars());
+        contextMenu.Items.Add("-");
+
+        // Monitor submenu
+        var monitorMenu = new ToolStripMenuItem("Monitor");
+        var multiItem = new ToolStripMenuItem("All Monitors")
+        {
+            Checked = _settings.MultiMonitor
+        };
+        multiItem.Click += (s, e) =>
+        {
+            _settings.MultiMonitor = true;
+            _settings.Save();
+            RecreateAppBars();
+            BuildContextMenu();
+        };
+        monitorMenu.DropDownItems.Add(multiItem);
+        monitorMenu.DropDownItems.Add("-");
+
+        for (int i = 0; i < Screen.AllScreens.Length; i++)
+        {
+            var screen = Screen.AllScreens[i];
+            var idx = i;
+            var item = new ToolStripMenuItem($"Monitor {i + 1}{(screen.Primary ? " (Primary)" : "")}")
+            {
+                Checked = !_settings.MultiMonitor && _settings.MonitorIndex == i
+            };
+            item.Click += (s, e) =>
+            {
+                _settings.MultiMonitor = false;
+                _settings.MonitorIndex = idx;
+                _settings.Save();
+                RecreateAppBars();
+                BuildContextMenu();
+            };
+            monitorMenu.DropDownItems.Add(item);
+        }
+        contextMenu.Items.Add(monitorMenu);
+
+        // Dock position submenu
+        var dockMenu = new ToolStripMenuItem("Dock Position");
+        var topItem = new ToolStripMenuItem("Top") { Checked = _settings.DockPosition == DockPosition.Top };
+        topItem.Click += (s, e) =>
+        {
+            _settings.DockPosition = DockPosition.Top;
+            _settings.Save();
+            RecreateAppBars();
+            BuildContextMenu();
+        };
+        var bottomItem = new ToolStripMenuItem("Bottom") { Checked = _settings.DockPosition == DockPosition.Bottom };
+        bottomItem.Click += (s, e) =>
+        {
+            _settings.DockPosition = DockPosition.Bottom;
+            _settings.Save();
+            RecreateAppBars();
+            BuildContextMenu();
+        };
+        dockMenu.DropDownItems.Add(topItem);
+        dockMenu.DropDownItems.Add(bottomItem);
+        contextMenu.Items.Add(dockMenu);
+
+        contextMenu.Items.Add("-");
+        contextMenu.Items.Add("Settings Folder", null, (s, e) => AppSettings.OpenSettingsFolder());
+        contextMenu.Items.Add("-");
+        contextMenu.Items.Add("Exit", null, (s, e) => Exit());
+
+        _trayIcon.ContextMenuStrip = contextMenu;
+    }
+
+    private void CreateAppBars()
+    {
+        if (_settings.MultiMonitor)
+        {
+            foreach (var screen in Screen.AllScreens)
+            {
+                var bar = new AddressBarForm(screen, _settings);
+                bar.Show();
+                _bars.Add(bar);
+            }
+        }
+        else
+        {
+            var screens = Screen.AllScreens;
+            var targetScreen = _settings.MonitorIndex < screens.Length
+                ? screens[_settings.MonitorIndex]
+                : Screen.PrimaryScreen!;
+            var bar = new AddressBarForm(targetScreen, _settings);
+            bar.Show();
+            _bars.Add(bar);
+        }
+    }
+
+    private void RecreateAppBars()
+    {
+        foreach (var bar in _bars)
+        {
+            bar.Cleanup();
+            bar.Close();
+        }
+        _bars.Clear();
+        _settings = AppSettings.Load();
+        CreateAppBars();
+    }
+
+    private void ShowAllBars()
+    {
+        foreach (var bar in _bars)
+        {
+            bar.ShowAppBar();
+        }
+    }
+
+    private void HideAllBars()
+    {
+        foreach (var bar in _bars)
+        {
+            bar.HideAppBar();
+        }
+    }
+
+    private void Exit()
+    {
+        foreach (var bar in _bars)
+        {
+            bar.Cleanup();
+            bar.Close();
+        }
+        _trayIcon.Visible = false;
+        _trayIcon.Dispose();
+        SystemEvents.DisplaySettingsChanged -= (s, e) => RecreateAppBars();
+        Application.Exit();
+    }
+}
+
+#endregion
 
 public class AddressBarForm : Form
 {
@@ -34,15 +256,13 @@ public class AddressBarForm : Form
     private const uint ABM_REMOVE = 0x01;
     private const uint ABM_QUERYPOS = 0x02;
     private const uint ABM_SETPOS = 0x03;
-    private const uint ABM_ACTIVATE = 0x06;
-    private const uint ABM_WINDOWPOSCHANGED = 0x09;
 
     private const int ABN_STATECHANGE = 0x00;
     private const int ABN_POSCHANGED = 0x01;
     private const int ABN_FULLSCREENAPP = 0x02;
-    private const int ABN_WINDOWARRANGE = 0x03;
 
     private const uint ABE_TOP = 1;
+    private const uint ABE_BOTTOM = 3;
 
     private const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
 
@@ -73,7 +293,9 @@ public class AddressBarForm : Form
 
     #endregion
 
-    private readonly int _appBarHeight = 30;
+    private readonly Screen _screen;
+    private readonly AppSettings _settings;
+    private int _appBarHeight;
     private uint _callbackMessageId;
     private bool _appBarRegistered;
     private bool _isFullScreen;
@@ -81,24 +303,22 @@ public class AddressBarForm : Form
     private readonly TextBox _addressBox;
     private readonly Button _goButton;
     private readonly Label _addressLabel;
-    private readonly NotifyIcon _trayIcon;
 
-    public AddressBarForm()
+    public AddressBarForm(Screen screen, AppSettings settings)
     {
-        // Form setup
+        _screen = screen;
+        _settings = settings;
+
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
         TopMost = true;
         StartPosition = FormStartPosition.Manual;
         BackColor = GetSystemBackColor();
 
-        // Scale height for DPI
-        _appBarHeight = LogicalToDeviceUnits(30);
+        _appBarHeight = LogicalToDeviceUnits(_settings.BarHeight);
 
-        // Apply dark mode to title bar (affects some elements)
         ApplyDarkMode();
 
-        // Create controls
         _addressLabel = new Label
         {
             Text = "Address",
@@ -135,28 +355,10 @@ public class AddressBarForm : Form
         Controls.Add(_addressBox);
         Controls.Add(_goButton);
 
-        // System tray icon
-        _trayIcon = new NotifyIcon
-        {
-            Icon = SystemIcons.Application,
-            Text = "Address Bar",
-            Visible = true
-        };
-
-        var contextMenu = new ContextMenuStrip();
-        contextMenu.Items.Add("Show", null, (s, e) => ShowAppBar());
-        contextMenu.Items.Add("Hide", null, (s, e) => HideAppBar());
-        contextMenu.Items.Add("-");
-        contextMenu.Items.Add("Exit", null, (s, e) => Application.Exit());
-        _trayIcon.ContextMenuStrip = contextMenu;
-        _trayIcon.DoubleClick += (s, e) => ShowAppBar();
-
-        // Listen for theme changes
         SystemEvents.UserPreferenceChanged += SystemEvents_UserPreferenceChanged;
 
         Resize += (s, e) => LayoutControls();
         Load += AddressBarForm_Load;
-        FormClosing += AddressBarForm_FormClosing;
     }
 
     private void AddressBarForm_Load(object? sender, EventArgs e)
@@ -165,11 +367,9 @@ public class AddressBarForm : Form
         LayoutControls();
     }
 
-    private void AddressBarForm_FormClosing(object? sender, FormClosingEventArgs e)
+    public void Cleanup()
     {
         UnregisterAppBar();
-        _trayIcon.Visible = false;
-        _trayIcon.Dispose();
         SystemEvents.UserPreferenceChanged -= SystemEvents_UserPreferenceChanged;
     }
 
@@ -196,7 +396,7 @@ public class AddressBarForm : Form
     {
         if (_appBarRegistered) return;
 
-        _callbackMessageId = (uint)RegisterWindowMessage("AddressBarAppBarMessage");
+        _callbackMessageId = (uint)RegisterWindowMessage($"AddressBarAppBarMessage_{_screen.DeviceName}");
 
         var abd = new APPBARDATA
         {
@@ -231,40 +431,49 @@ public class AddressBarForm : Form
     {
         if (!_appBarRegistered) return;
 
-        var screen = Screen.PrimaryScreen!;
-        var workArea = screen.Bounds;
+        var bounds = _screen.Bounds;
+        uint edge = _settings.DockPosition == DockPosition.Top ? ABE_TOP : ABE_BOTTOM;
+
+        int top, bottom;
+        if (_settings.DockPosition == DockPosition.Top)
+        {
+            top = bounds.Top;
+            bottom = bounds.Top + _appBarHeight;
+        }
+        else
+        {
+            top = bounds.Bottom - _appBarHeight;
+            bottom = bounds.Bottom;
+        }
 
         var abd = new APPBARDATA
         {
             cbSize = Marshal.SizeOf<APPBARDATA>(),
             hWnd = Handle,
-            uEdge = ABE_TOP,
+            uEdge = edge,
             rc = new RECT
             {
-                left = workArea.Left,
-                top = workArea.Top,
-                right = workArea.Right,
-                bottom = workArea.Top + _appBarHeight
+                left = bounds.Left,
+                top = top,
+                right = bounds.Right,
+                bottom = bottom
             }
         };
 
-        // Query for position
         SHAppBarMessage(ABM_QUERYPOS, ref abd);
 
-        // Adjust based on query result
-        abd.rc.bottom = abd.rc.top + _appBarHeight;
+        if (_settings.DockPosition == DockPosition.Top)
+            abd.rc.bottom = abd.rc.top + _appBarHeight;
+        else
+            abd.rc.top = abd.rc.bottom - _appBarHeight;
 
-        // Set the position
         SHAppBarMessage(ABM_SETPOS, ref abd);
 
-        // Actually move the window
         SetBounds(abd.rc.left, abd.rc.top, abd.rc.right - abd.rc.left, abd.rc.bottom - abd.rc.top);
-
-        // Ensure topmost
         SetWindowPos(Handle, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
 
-    private void ShowAppBar()
+    public void ShowAppBar()
     {
         Show();
         if (!_appBarRegistered)
@@ -274,7 +483,7 @@ public class AddressBarForm : Form
         SetAppBarPos();
     }
 
-    private void HideAppBar()
+    public void HideAppBar()
     {
         UnregisterAppBar();
         Hide();
@@ -294,7 +503,6 @@ public class AddressBarForm : Form
                     _isFullScreen = m.LParam.ToInt32() != 0;
                     if (_isFullScreen)
                     {
-                        // A fullscreen app is active, lower our z-order
                         TopMost = false;
                     }
                     else
@@ -319,7 +527,7 @@ public class AddressBarForm : Form
         get
         {
             var cp = base.CreateParams;
-            cp.ExStyle |= 0x00000080; // WS_EX_TOOLWINDOW - don't show in taskbar/alt-tab
+            cp.ExStyle |= 0x00000080; // WS_EX_TOOLWINDOW
             return cp;
         }
     }
@@ -354,7 +562,6 @@ public class AddressBarForm : Form
 
         try
         {
-            // Check if it's a URL
             if (Uri.TryCreate(input, UriKind.Absolute, out var uri) &&
                 (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps))
             {
@@ -362,7 +569,6 @@ public class AddressBarForm : Form
                 return;
             }
 
-            // Check if it looks like a URL without scheme
             if (input.Contains('.') && !input.Contains(' ') && !input.Contains('\\') && !input.Contains('/'))
             {
                 string url = "https://" + input;
@@ -373,7 +579,6 @@ public class AddressBarForm : Form
                 }
             }
 
-            // Check if it's a file or folder path
             string expandedPath = Environment.ExpandEnvironmentVariables(input);
             if (Directory.Exists(expandedPath))
             {
@@ -386,7 +591,6 @@ public class AddressBarForm : Form
                 return;
             }
 
-            // Try as shell command
             Process.Start(new ProcessStartInfo(input) { UseShellExecute = true });
         }
         catch (Exception ex)
@@ -423,36 +627,25 @@ public class AddressBarForm : Form
         }
     }
 
-    private static Color GetSystemBackColor()
-    {
-        return IsDarkMode() ? Color.FromArgb(32, 32, 32) : Color.FromArgb(243, 243, 243);
-    }
+    private static Color GetSystemBackColor() =>
+        IsDarkMode() ? Color.FromArgb(32, 32, 32) : Color.FromArgb(243, 243, 243);
 
-    private static Color GetSystemForeColor()
-    {
-        return IsDarkMode() ? Color.FromArgb(255, 255, 255) : Color.FromArgb(0, 0, 0);
-    }
+    private static Color GetSystemForeColor() =>
+        IsDarkMode() ? Color.FromArgb(255, 255, 255) : Color.FromArgb(0, 0, 0);
 
-    private static Color GetTextBoxBackColor()
-    {
-        return IsDarkMode() ? Color.FromArgb(45, 45, 45) : Color.White;
-    }
+    private static Color GetTextBoxBackColor() =>
+        IsDarkMode() ? Color.FromArgb(45, 45, 45) : Color.White;
 
-    private static Color GetButtonBackColor()
-    {
-        return IsDarkMode() ? Color.FromArgb(55, 55, 55) : Color.FromArgb(225, 225, 225);
-    }
+    private static Color GetButtonBackColor() =>
+        IsDarkMode() ? Color.FromArgb(55, 55, 55) : Color.FromArgb(225, 225, 225);
 
-    private static Color GetBorderColor()
-    {
-        return IsDarkMode() ? Color.FromArgb(70, 70, 70) : Color.FromArgb(200, 200, 200);
-    }
+    private static Color GetBorderColor() =>
+        IsDarkMode() ? Color.FromArgb(70, 70, 70) : Color.FromArgb(200, 200, 200);
 
     private void SystemEvents_UserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
     {
         if (e.Category == UserPreferenceCategory.General)
         {
-            // Theme might have changed
             UpdateTheme();
         }
     }
