@@ -26,10 +26,13 @@ public class AppSettings
     public int MonitorIndex { get; set; } = 0;
     public int BarHeight { get; set; } = 40;
     public DockPosition DockPosition { get; set; } = DockPosition.Top;
+    public bool RunAtStartup { get; set; } = false;
 
     private static readonly string SettingsDir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AddressBar");
     private static readonly string SettingsPath = Path.Combine(SettingsDir, "settings.json");
+    private const string StartupKeyPath = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
+    private const string StartupValueName = "AddressBar";
 
     public static AppSettings Load()
     {
@@ -52,8 +55,40 @@ public class AppSettings
             Directory.CreateDirectory(SettingsDir);
             var json = JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
             File.WriteAllText(SettingsPath, json);
+            ApplyStartupSetting();
         }
         catch { }
+    }
+
+    public void ApplyStartupSetting()
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(StartupKeyPath, true);
+            if (key == null) return;
+
+            if (RunAtStartup)
+            {
+                var exePath = Process.GetCurrentProcess().MainModule?.FileName;
+                if (!string.IsNullOrEmpty(exePath))
+                    key.SetValue(StartupValueName, $"\"{exePath}\"");
+            }
+            else
+            {
+                key.DeleteValue(StartupValueName, false);
+            }
+        }
+        catch { }
+    }
+
+    public static bool IsRunningAtStartup()
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(StartupKeyPath);
+            return key?.GetValue(StartupValueName) != null;
+        }
+        catch { return false; }
     }
 }
 
@@ -68,6 +103,7 @@ public class SettingsDialog : Form
     private readonly ComboBox _monitorSelectCombo;
     private readonly ComboBox _dockPositionCombo;
     private readonly NumericUpDown _barHeightNumeric;
+    private readonly CheckBox _startupCheckbox;
     private readonly Button _saveButton;
     private readonly Button _cancelButton;
 
@@ -82,7 +118,7 @@ public class SettingsDialog : Form
         MaximizeBox = false;
         MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        Size = new Size(350, 220);
+        Size = new Size(350, 255);
         BackColor = IsDarkMode() ? Color.FromArgb(32, 32, 32) : SystemColors.Control;
         ForeColor = IsDarkMode() ? Color.White : SystemColors.ControlText;
 
@@ -156,6 +192,18 @@ public class SettingsDialog : Form
         };
         Controls.Add(heightLabel);
         Controls.Add(_barHeightNumeric);
+        y += rowHeight;
+
+        // Run at Startup
+        _startupCheckbox = new CheckBox
+        {
+            Text = "Run at Windows startup",
+            Location = new Point(labelX, y + 3),
+            AutoSize = true,
+            Font = labelFont,
+            Checked = AppSettings.IsRunningAtStartup()
+        };
+        Controls.Add(_startupCheckbox);
         y += rowHeight + 10;
 
         // Buttons
@@ -198,16 +246,19 @@ public class SettingsDialog : Form
         var newMonitorIndex = _monitorSelectCombo.SelectedIndex;
         var newDockPosition = _dockPositionCombo.SelectedIndex == 1 ? DockPosition.Bottom : DockPosition.Top;
         var newBarHeight = (int)_barHeightNumeric.Value;
+        var newStartup = _startupCheckbox.Checked;
 
         if (newMode != _settings.MonitorMode ||
             newMonitorIndex != _settings.MonitorIndex ||
             newDockPosition != _settings.DockPosition ||
-            newBarHeight != _settings.BarHeight)
+            newBarHeight != _settings.BarHeight ||
+            newStartup != _settings.RunAtStartup)
         {
             _settings.MonitorMode = newMode;
             _settings.MonitorIndex = newMonitorIndex;
             _settings.DockPosition = newDockPosition;
             _settings.BarHeight = newBarHeight;
+            _settings.RunAtStartup = newStartup;
             _settings.Save();
             SettingsChanged = true;
         }
