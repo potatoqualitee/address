@@ -21,6 +21,7 @@ static class Program
 
 public enum DockPosition { Top, Bottom }
 public enum MonitorMode { Single, All }
+public enum IconPosition { Inside, Left }
 
 public class AppSettings
 {
@@ -28,6 +29,7 @@ public class AppSettings
     public int MonitorIndex { get; set; } = 0;
     public int BarHeight { get; set; } = 40;
     public DockPosition DockPosition { get; set; } = DockPosition.Top;
+    public IconPosition IconPosition { get; set; } = IconPosition.Inside;
     public bool RunAtStartup { get; set; } = false;
 
     private static readonly string SettingsDir = Path.Combine(
@@ -104,6 +106,7 @@ public class SettingsDialog : Form
     private readonly ComboBox _monitorModeCombo;
     private readonly ComboBox _monitorSelectCombo;
     private readonly ComboBox _dockPositionCombo;
+    private readonly ComboBox _iconPositionCombo;
     private readonly NumericUpDown _barHeightNumeric;
     private readonly CheckBox _startupCheckbox;
     private readonly Button _saveButton;
@@ -120,7 +123,7 @@ public class SettingsDialog : Form
         MaximizeBox = false;
         MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        Size = new Size(350, 255);
+        Size = new Size(350, 290);
         BackColor = IsDarkMode() ? Color.FromArgb(32, 32, 32) : SystemColors.Control;
         ForeColor = IsDarkMode() ? Color.White : SystemColors.ControlText;
 
@@ -196,6 +199,21 @@ public class SettingsDialog : Form
         Controls.Add(_barHeightNumeric);
         y += rowHeight;
 
+        // Icon Position
+        var iconPosLabel = new Label { Text = "Icon Position:", Location = new Point(labelX, y + 3), AutoSize = true, Font = labelFont };
+        _iconPositionCombo = new ComboBox
+        {
+            Location = new Point(controlX, y),
+            Width = controlWidth,
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Font = labelFont
+        };
+        _iconPositionCombo.Items.AddRange(new object[] { "Inside Address Box", "Left of Address Box" });
+        _iconPositionCombo.SelectedIndex = _settings.IconPosition == IconPosition.Left ? 1 : 0;
+        Controls.Add(iconPosLabel);
+        Controls.Add(_iconPositionCombo);
+        y += rowHeight;
+
         // Run at Startup
         _startupCheckbox = new CheckBox
         {
@@ -248,18 +266,21 @@ public class SettingsDialog : Form
         var newMonitorIndex = _monitorSelectCombo.SelectedIndex;
         var newDockPosition = _dockPositionCombo.SelectedIndex == 1 ? DockPosition.Bottom : DockPosition.Top;
         var newBarHeight = (int)_barHeightNumeric.Value;
+        var newIconPosition = _iconPositionCombo.SelectedIndex == 1 ? IconPosition.Left : IconPosition.Inside;
         var newStartup = _startupCheckbox.Checked;
 
         if (newMode != _settings.MonitorMode ||
             newMonitorIndex != _settings.MonitorIndex ||
             newDockPosition != _settings.DockPosition ||
             newBarHeight != _settings.BarHeight ||
+            newIconPosition != _settings.IconPosition ||
             newStartup != _settings.RunAtStartup)
         {
             _settings.MonitorMode = newMode;
             _settings.MonitorIndex = newMonitorIndex;
             _settings.DockPosition = newDockPosition;
             _settings.BarHeight = newBarHeight;
+            _settings.IconPosition = newIconPosition;
             _settings.RunAtStartup = newStartup;
             _settings.Save();
             SettingsChanged = true;
@@ -593,10 +614,19 @@ public class AddressBarForm : Form
         {
             Size = new Size(16, 16),
             SizeMode = PictureBoxSizeMode.Zoom,
-            BackColor = Color.Transparent
+            BackColor = _settings.IconPosition == IconPosition.Inside ? GetTextBoxBackColor() : GetSystemBackColor()
         };
 
-        Controls.Add(_iconBox);
+        // Add icon to the appropriate parent based on settings
+        if (_settings.IconPosition == IconPosition.Inside)
+        {
+            _addressBoxContainer.Controls.Add(_iconBox);
+        }
+        else
+        {
+            Controls.Add(_iconBox);
+        }
+
         Controls.Add(_addressLabel);
         Controls.Add(_addressBoxContainer);
         Controls.Add(_goButton);
@@ -613,6 +643,7 @@ public class AddressBarForm : Form
         RegisterAppBar();
         SetTextBoxMargins();
         LayoutControls();
+        _iconBox.Image = GetDefaultAppIcon();
     }
 
     private void SetTextBoxMargins()
@@ -640,25 +671,48 @@ public class AddressBarForm : Form
         int buttonWidth = _goButton.Width;
         int settingsWidth = _settingsButton.Width;
 
-        // Icon box at the left
-        _iconBox.Size = new Size(iconSize, iconSize);
-        _iconBox.Location = new Point(padding, (Height - iconSize) / 2);
-
-        // Label after icon
-        _addressLabel.Location = new Point(padding + iconSize + iconPadding, (Height - _addressLabel.Height) / 2);
-
-        int textBoxLeft = padding + iconSize + iconPadding + labelWidth;
-        int textBoxWidth = Width - textBoxLeft - buttonWidth - settingsWidth - padding * 3;
         int containerHeight = _addressBox.PreferredHeight + 6;
         int controlsY = (Height - containerHeight) / 2;
 
-        _addressBoxContainer.Location = new Point(textBoxLeft, controlsY);
-        _addressBoxContainer.Size = new Size(textBoxWidth, containerHeight);
+        _iconBox.Size = new Size(iconSize, iconSize);
 
-        // Center textbox vertically inside container, with left padding
-        int textBoxY = (containerHeight - _addressBox.PreferredHeight - 2) / 2;
-        _addressBox.Location = new Point(4, textBoxY);
-        _addressBox.Width = textBoxWidth - 10;
+        if (_settings.IconPosition == IconPosition.Left)
+        {
+            // Icon on the left, then label, then address box
+            _iconBox.Location = new Point(padding, (Height - iconSize) / 2);
+            _addressLabel.Location = new Point(padding + iconSize + iconPadding, (Height - _addressLabel.Height) / 2);
+
+            int textBoxLeft = padding + iconSize + iconPadding + labelWidth;
+            int textBoxWidth = Width - textBoxLeft - buttonWidth - settingsWidth - padding * 3;
+
+            _addressBoxContainer.Location = new Point(textBoxLeft, controlsY);
+            _addressBoxContainer.Size = new Size(textBoxWidth, containerHeight);
+
+            // Textbox fills the container (no icon inside)
+            int textBoxY = (containerHeight - _addressBox.PreferredHeight - 2) / 2;
+            _addressBox.Location = new Point(4, textBoxY);
+            _addressBox.Width = textBoxWidth - 10;
+        }
+        else
+        {
+            // Label on the left, then address box with icon inside
+            _addressLabel.Location = new Point(padding, (Height - _addressLabel.Height) / 2);
+
+            int textBoxLeft = padding + labelWidth;
+            int textBoxWidth = Width - textBoxLeft - buttonWidth - settingsWidth - padding * 3;
+
+            _addressBoxContainer.Location = new Point(textBoxLeft, controlsY);
+            _addressBoxContainer.Size = new Size(textBoxWidth, containerHeight);
+
+            // Icon inside container, on the left
+            _iconBox.Location = new Point(4, (containerHeight - iconSize - 2) / 2);
+
+            // Textbox after the icon inside container
+            int textBoxY = (containerHeight - _addressBox.PreferredHeight - 2) / 2;
+            int textBoxInternalLeft = iconSize + iconPadding + 4;
+            _addressBox.Location = new Point(textBoxInternalLeft, textBoxY);
+            _addressBox.Width = textBoxWidth - textBoxInternalLeft - 6;
+        }
 
         _goButton.Location = new Point(Width - buttonWidth - settingsWidth - padding * 2, controlsY);
         _goButton.Height = containerHeight;
@@ -939,6 +993,7 @@ public class AddressBarForm : Form
         _addressBox.BackColor = GetTextBoxBackColor();
         _addressBox.ForeColor = GetSystemForeColor();
         _addressBoxContainer.BackColor = GetTextBoxBackColor();
+        _iconBox.BackColor = _settings.IconPosition == IconPosition.Inside ? GetTextBoxBackColor() : GetSystemBackColor();
         _goButton.BackColor = GetButtonBackColor();
         _goButton.ForeColor = GetSystemForeColor();
         _goButton.FlatAppearance.BorderColor = GetBorderColor();
@@ -963,8 +1018,9 @@ public class AddressBarForm : Form
         string input = _addressBox.Text.Trim();
         if (string.IsNullOrEmpty(input))
         {
-            _iconBox.Image?.Dispose();
-            _iconBox.Image = null;
+            var oldImage = _iconBox.Image;
+            _iconBox.Image = GetDefaultAppIcon();
+            oldImage?.Dispose();
             return;
         }
 
@@ -1009,7 +1065,7 @@ public class AddressBarForm : Form
         if (Uri.TryCreate(input, UriKind.Absolute, out var uri) &&
             (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps))
         {
-            return await GetFaviconAsync(uri, token);
+            return await GetFaviconAsync(uri, token) ?? GetDefaultAppIcon();
         }
 
         // 3. Looks like a domain without scheme (e.g., "google.com")
@@ -1017,7 +1073,7 @@ public class AddressBarForm : Form
         {
             if (Uri.TryCreate("https://" + input, UriKind.Absolute, out uri))
             {
-                return await GetFaviconAsync(uri, token);
+                return await GetFaviconAsync(uri, token) ?? GetDefaultAppIcon();
             }
         }
 
@@ -1034,6 +1090,25 @@ public class AddressBarForm : Form
             return GetFileIcon(exePath, isDirectory: false);
         }
 
+        return null;
+    }
+
+    /// <summary>
+    /// Gets the default app icon (addressbar.ico) as a fallback
+    /// </summary>
+    private static Image? GetDefaultAppIcon()
+    {
+        try
+        {
+            var exePath = System.Reflection.Assembly.GetExecutingAssembly().Location;
+            var iconPath = Path.Combine(Path.GetDirectoryName(exePath)!, "addressbar.ico");
+            if (File.Exists(iconPath))
+            {
+                using var icon = new Icon(iconPath, 16, 16);
+                return icon.ToBitmap();
+            }
+        }
+        catch { }
         return null;
     }
 
@@ -1164,6 +1239,11 @@ public class AddressBarForm : Form
                 request.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
 
                 using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token);
+
+                // Use the final URL after redirects to get the correct host
+                var finalUri = response.RequestMessage?.RequestUri ?? uri;
+                baseUrl = $"{finalUri.Scheme}://{finalUri.Host}";
+
                 if (response.IsSuccessStatusCode && response.Content.Headers.ContentType?.MediaType?.Contains("text/html") == true)
                 {
                     var html = await response.Content.ReadAsStringAsync(token);
@@ -1196,11 +1276,15 @@ public class AddressBarForm : Form
     {
         // Look for: <link rel="icon" href="..."> or <link rel="shortcut icon" href="...">
         // Also handle: <link href="..." rel="icon">
+        // Supports both quoted and unquoted attribute values
         var patterns = new[]
         {
-            @"<link[^>]*rel\s*=\s*[""'](?:shortcut\s+)?icon[""'][^>]*href\s*=\s*[""']([^""']+)[""']",
-            @"<link[^>]*href\s*=\s*[""']([^""']+)[""'][^>]*rel\s*=\s*[""'](?:shortcut\s+)?icon[""']",
-            @"<link[^>]*rel\s*=\s*[""']apple-touch-icon[""'][^>]*href\s*=\s*[""']([^""']+)[""']"
+            // rel="icon" or rel=icon followed by href
+            @"<link[^>]*rel\s*=\s*[""']?(?:shortcut\s+)?icon[""']?[^>]*href\s*=\s*[""']?([^""'\s>]+)[""']?",
+            // href followed by rel="icon" or rel=icon
+            @"<link[^>]*href\s*=\s*[""']?([^""'\s>]+)[""']?[^>]*rel\s*=\s*[""']?(?:shortcut\s+)?icon[""']?",
+            // apple-touch-icon
+            @"<link[^>]*rel\s*=\s*[""']?apple-touch-icon[""']?[^>]*href\s*=\s*[""']?([^""'\s>]+)[""']?"
         };
 
         foreach (var pattern in patterns)
@@ -1235,11 +1319,20 @@ public class AddressBarForm : Form
     {
         try
         {
+            // Skip SVG files - they require a separate rendering library
+            if (url.EndsWith(".svg", StringComparison.OrdinalIgnoreCase))
+                return null;
+
             using var request = new HttpRequestMessage(HttpMethod.Get, url);
             request.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
 
             using var response = await _httpClient.SendAsync(request, token);
             if (!response.IsSuccessStatusCode || response.Content.Headers.ContentLength == 0)
+                return null;
+
+            // Skip SVG content type
+            var contentType = response.Content.Headers.ContentType?.MediaType;
+            if (contentType?.Contains("svg") == true)
                 return null;
 
             var bytes = await response.Content.ReadAsByteArrayAsync(token);
