@@ -790,13 +790,13 @@ public class AddressBarForm : Form
 
         _goButton = new Button
         {
-            Text = "→",
+            Text = "Go",
             FlatStyle = FlatStyle.Flat,
             Font = new Font("Segoe UI", 9f),
             BackColor = GetButtonBackColor(),
             ForeColor = GetSystemForeColor(),
             Cursor = Cursors.Hand,
-            Width = LogicalToDeviceUnits(30)
+            Width = LogicalToDeviceUnits(40)
         };
         _goButton.FlatAppearance.BorderSize = 1;
         _goButton.FlatAppearance.BorderColor = GetBorderColor();
@@ -823,7 +823,7 @@ public class AddressBarForm : Form
             BackColor = _settings.IconPosition == IconPosition.Inside ? GetTextBoxBackColor() : GetSystemBackColor()
         };
 
-        // Dropdown button - inside the container, no left border, seamless with textbox
+        // Dropdown button - inside the container, no border, seamless with textbox
         _dropdownButton = new Button
         {
             Text = "▼",
@@ -835,10 +835,12 @@ public class AddressBarForm : Form
             Width = LogicalToDeviceUnits(20),
             TabStop = false
         };
-        _dropdownButton.FlatAppearance.BorderSize = 0; // No border at all
+        _dropdownButton.FlatAppearance.BorderSize = 0;
+        _dropdownButton.FlatAppearance.BorderColor = GetTextBoxBackColor(); // Match background to hide any border
         _dropdownButton.FlatAppearance.MouseOverBackColor = GetDropdownHoverColor();
         _dropdownButton.FlatAppearance.MouseDownBackColor = GetDropdownHoverColor();
         _dropdownButton.Click += DropdownButton_Click;
+        _dropdownButton.GotFocus += (s, e) => _addressBox.Focus(); // Redirect focus to textbox
 
         // History dropdown popup
         _historyDropdown = new HistoryDropdown();
@@ -1243,6 +1245,7 @@ public class AddressBarForm : Form
         _iconBox.BackColor = _settings.IconPosition == IconPosition.Inside ? GetTextBoxBackColor() : GetSystemBackColor();
         _dropdownButton.BackColor = GetTextBoxBackColor();
         _dropdownButton.ForeColor = GetSystemForeColor();
+        _dropdownButton.FlatAppearance.BorderColor = GetTextBoxBackColor();
         _dropdownButton.FlatAppearance.MouseOverBackColor = GetDropdownHoverColor();
         _dropdownButton.FlatAppearance.MouseDownBackColor = GetDropdownHoverColor();
         _goButton.BackColor = GetButtonBackColor();
