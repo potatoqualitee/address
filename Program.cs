@@ -1139,6 +1139,7 @@ public class AddressBarForm : Form
 
         try
         {
+            // 1. Already a full URL with scheme
             if (Uri.TryCreate(input, UriKind.Absolute, out var uri) &&
                 (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps))
             {
@@ -1147,7 +1148,9 @@ public class AddressBarForm : Form
                 return;
             }
 
-            if (input.Contains('.') && !input.Contains(' ') && !input.Contains('\\') && !input.Contains('/'))
+            // 2. Looks like a URL (has dot, no spaces, no backslash) - add https://
+            // Allow forward slashes for paths like github.com/user/repo
+            if (input.Contains('.') && !input.Contains(' ') && !input.Contains('\\'))
             {
                 string url = "https://" + input;
                 if (Uri.TryCreate(url, UriKind.Absolute, out uri))
@@ -1158,6 +1161,7 @@ public class AddressBarForm : Form
                 }
             }
 
+            // 3. Local directory
             string expandedPath = Environment.ExpandEnvironmentVariables(input);
             if (Directory.Exists(expandedPath))
             {
@@ -1165,6 +1169,8 @@ public class AddressBarForm : Form
                 SaveToHistory(input);
                 return;
             }
+
+            // 4. Local file
             if (File.Exists(expandedPath))
             {
                 Process.Start(new ProcessStartInfo(expandedPath) { UseShellExecute = true });
@@ -1172,6 +1178,7 @@ public class AddressBarForm : Form
                 return;
             }
 
+            // 5. Fall back to shell execute (commands, etc.)
             Process.Start(new ProcessStartInfo(input) { UseShellExecute = true });
             SaveToHistory(input);
         }
@@ -1322,8 +1329,9 @@ public class AddressBarForm : Form
             return await GetFaviconAsync(uri, token) ?? GetDefaultAppIcon();
         }
 
-        // 3. Looks like a domain without scheme (e.g., "google.com")
-        if (input.Contains('.') && !input.Contains('\\') && !input.Contains('/') && !input.Contains(' '))
+        // 3. Looks like a URL without scheme (e.g., "google.com" or "github.com/user/repo")
+        // Allow forward slashes for paths like github.com/user/repo
+        if (input.Contains('.') && !input.Contains('\\') && !input.Contains(' '))
         {
             if (Uri.TryCreate("https://" + input, UriKind.Absolute, out uri))
             {
@@ -1331,8 +1339,8 @@ public class AddressBarForm : Form
             }
         }
 
-        // 4. Try to get icon by file extension if it looks like a path
-        if (input.Contains('\\') || input.Contains('/'))
+        // 4. Try to get icon by file extension if it looks like a local path (backslash indicates Windows path)
+        if (input.Contains('\\'))
         {
             return GetFileIcon(expanded, isDirectory: false);
         }
