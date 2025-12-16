@@ -1027,6 +1027,63 @@ public class AddressBarForm : Form
             return GetFileIcon(expanded, isDirectory: false);
         }
 
+        // 5. Try to find executable in PATH (for commands like "notepad", "explorer")
+        var exePath = FindExecutableInPath(input);
+        if (exePath != null)
+        {
+            return GetFileIcon(exePath, isDirectory: false);
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Searches for an executable in the system PATH
+    /// </summary>
+    private static string? FindExecutableInPath(string name)
+    {
+        // Add .exe if no extension
+        string fileName = name;
+        if (!Path.HasExtension(fileName))
+        {
+            fileName += ".exe";
+        }
+
+        // Check if it's already a valid path
+        if (File.Exists(fileName))
+        {
+            return Path.GetFullPath(fileName);
+        }
+
+        // Search in PATH environment variable
+        var pathEnv = Environment.GetEnvironmentVariable("PATH");
+        if (string.IsNullOrEmpty(pathEnv))
+            return null;
+
+        var paths = pathEnv.Split(Path.PathSeparator);
+        foreach (var dir in paths)
+        {
+            try
+            {
+                var fullPath = Path.Combine(dir, fileName);
+                if (File.Exists(fullPath))
+                {
+                    return fullPath;
+                }
+            }
+            catch { }
+        }
+
+        // Also check Windows directory
+        var winDir = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+        var winPath = Path.Combine(winDir, fileName);
+        if (File.Exists(winPath))
+            return winPath;
+
+        var sys32Path = Path.Combine(winDir, "System32", fileName);
+        if (File.Exists(sys32Path))
+            return sys32Path;
+
         return null;
     }
 
@@ -1035,28 +1092,53 @@ public class AddressBarForm : Form
     /// </summary>
     private static Image? GetFileIcon(string path, bool isDirectory)
     {
-        var shfi = new SHFILEINFO();
-        uint flags = SHGFI_ICON | SHGFI_SMALLICON;
-        uint attributes = isDirectory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
-
-        // If file doesn't exist, use SHGFI_USEFILEATTRIBUTES to get icon by extension
-        bool exists = isDirectory ? Directory.Exists(path) : File.Exists(path);
-        if (!exists)
-        {
-            flags |= SHGFI_USEFILEATTRIBUTES;
-        }
-
         try
         {
+            // Ensure we have an absolute path
+            if (!Path.IsPathRooted(path))
+            {
+                path = Path.GetFullPath(path);
+            }
+
+            bool exists = isDirectory ? Directory.Exists(path) : File.Exists(path);
+
+            // For existing files, use Icon.ExtractAssociatedIcon (more reliable)
+            if (exists && !isDirectory)
+            {
+                try
+                {
+                    using var icon = Icon.ExtractAssociatedIcon(path);
+                    if (icon != null)
+                    {
+                        return icon.ToBitmap();
+                    }
+                }
+                catch { /* Fall through to SHGetFileInfo */ }
+            }
+
+            // For directories or if ExtractAssociatedIcon failed, use SHGetFileInfo
+            var shfi = new SHFILEINFO();
+            uint flags = SHGFI_ICON | SHGFI_SMALLICON;
+            uint attributes = isDirectory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+
+            if (!exists)
+            {
+                flags |= SHGFI_USEFILEATTRIBUTES;
+            }
+
             IntPtr result = SHGetFileInfo(path, attributes, ref shfi, (uint)Marshal.SizeOf<SHFILEINFO>(), flags);
 
             if (result != IntPtr.Zero && shfi.hIcon != IntPtr.Zero)
             {
-                // Clone the icon to a bitmap before destroying the handle
-                using var icon = Icon.FromHandle(shfi.hIcon);
-                var bitmap = icon.ToBitmap();
-                DestroyIcon(shfi.hIcon);
-                return bitmap;
+                try
+                {
+                    using var icon = Icon.FromHandle(shfi.hIcon);
+                    return icon.ToBitmap();
+                }
+                finally
+                {
+                    DestroyIcon(shfi.hIcon);
+                }
             }
         }
         catch { }
