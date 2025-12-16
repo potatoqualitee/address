@@ -428,6 +428,12 @@ public class AddressBarForm : Form
     [DllImport("dwmapi.dll")]
     private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
 
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+    private const int EM_SETMARGINS = 0xD3;
+    private const int EC_LEFTMARGIN = 0x1;
+
     private const uint ABM_NEW = 0x00;
     private const uint ABM_REMOVE = 0x01;
     private const uint ABM_QUERYPOS = 0x02;
@@ -478,6 +484,7 @@ public class AddressBarForm : Form
     private bool _isFullScreen;
 
     private readonly TextBox _addressBox;
+    private readonly Panel _addressBoxContainer;
     private readonly Button _goButton;
     private readonly Button _settingsButton;
     private readonly Label _addressLabel;
@@ -509,12 +516,19 @@ public class AddressBarForm : Form
 
         _addressBox = new TextBox
         {
-            BorderStyle = BorderStyle.FixedSingle,
+            BorderStyle = BorderStyle.None,
             Font = new Font("Segoe UI", 9f),
             BackColor = GetTextBoxBackColor(),
             ForeColor = GetSystemForeColor()
         };
         _addressBox.KeyDown += AddressBox_KeyDown;
+
+        _addressBoxContainer = new Panel
+        {
+            BorderStyle = BorderStyle.FixedSingle,
+            BackColor = GetTextBoxBackColor()
+        };
+        _addressBoxContainer.Controls.Add(_addressBox);
 
         _goButton = new Button
         {
@@ -545,7 +559,7 @@ public class AddressBarForm : Form
         _settingsButton.Click += SettingsButton_Click;
 
         Controls.Add(_addressLabel);
-        Controls.Add(_addressBox);
+        Controls.Add(_addressBoxContainer);
         Controls.Add(_goButton);
         Controls.Add(_settingsButton);
 
@@ -558,7 +572,15 @@ public class AddressBarForm : Form
     private void AddressBarForm_Load(object? sender, EventArgs e)
     {
         RegisterAppBar();
+        SetTextBoxMargins();
         LayoutControls();
+    }
+
+    private void SetTextBoxMargins()
+    {
+        // Add left padding inside the textbox (4 pixels)
+        int leftMargin = LogicalToDeviceUnits(4);
+        SendMessage(_addressBox.Handle, EM_SETMARGINS, (IntPtr)EC_LEFTMARGIN, (IntPtr)leftMargin);
     }
 
     public void Cleanup()
@@ -578,14 +600,22 @@ public class AddressBarForm : Form
 
         int textBoxLeft = padding + labelWidth;
         int textBoxWidth = Width - textBoxLeft - buttonWidth - settingsWidth - padding * 3;
-        _addressBox.Location = new Point(textBoxLeft, (Height - _addressBox.Height) / 2);
-        _addressBox.Width = textBoxWidth;
+        int containerHeight = _addressBox.PreferredHeight + 6;
+        int controlsY = (Height - containerHeight) / 2;
 
-        _goButton.Location = new Point(Width - buttonWidth - settingsWidth - padding * 2, (Height - _goButton.Height) / 2);
-        _goButton.Height = _addressBox.Height;
+        _addressBoxContainer.Location = new Point(textBoxLeft, controlsY);
+        _addressBoxContainer.Size = new Size(textBoxWidth, containerHeight);
 
-        _settingsButton.Location = new Point(Width - settingsWidth - padding, (Height - _settingsButton.Height) / 2);
-        _settingsButton.Height = _addressBox.Height;
+        // Center textbox vertically inside container, with left padding
+        int textBoxY = (containerHeight - _addressBox.PreferredHeight - 2) / 2;
+        _addressBox.Location = new Point(4, textBoxY);
+        _addressBox.Width = textBoxWidth - 10;
+
+        _goButton.Location = new Point(Width - buttonWidth - settingsWidth - padding * 2, controlsY);
+        _goButton.Height = containerHeight;
+
+        _settingsButton.Location = new Point(Width - settingsWidth - padding, controlsY);
+        _settingsButton.Height = containerHeight;
     }
 
     #region AppBar Registration
@@ -775,7 +805,7 @@ public class AddressBarForm : Form
             if (input.Contains('.') && !input.Contains(' ') && !input.Contains('\\') && !input.Contains('/'))
             {
                 string url = "https://" + input;
-                if (Uri.TryCreate(url, UriKind.Absolute, out _))
+                if (Uri.TryCreate(url, UriKind.Absolute, out uri))
                 {
                     Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
                     return;
@@ -859,6 +889,7 @@ public class AddressBarForm : Form
         _addressLabel.ForeColor = GetSystemForeColor();
         _addressBox.BackColor = GetTextBoxBackColor();
         _addressBox.ForeColor = GetSystemForeColor();
+        _addressBoxContainer.BackColor = GetTextBoxBackColor();
         _goButton.BackColor = GetButtonBackColor();
         _goButton.ForeColor = GetSystemForeColor();
         _goButton.FlatAppearance.BorderColor = GetBorderColor();
