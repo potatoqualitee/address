@@ -1,6 +1,8 @@
 using System.Diagnostics;
+using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
 namespace AddressBar;
@@ -431,8 +433,21 @@ public class AddressBarForm : Form
     [DllImport("user32.dll")]
     private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 
+    [DllImport("shell32.dll", CharSet = CharSet.Auto)]
+    private static extern IntPtr SHGetFileInfo(string pszPath, uint dwFileAttributes,
+        ref SHFILEINFO psfi, uint cbSizeFileInfo, uint uFlags);
+
+    [DllImport("user32.dll")]
+    private static extern bool DestroyIcon(IntPtr hIcon);
+
     private const int EM_SETMARGINS = 0xD3;
     private const int EC_LEFTMARGIN = 0x1;
+
+    private const uint SHGFI_ICON = 0x100;
+    private const uint SHGFI_SMALLICON = 0x1;
+    private const uint SHGFI_USEFILEATTRIBUTES = 0x10;
+    private const uint FILE_ATTRIBUTE_NORMAL = 0x80;
+    private const uint FILE_ATTRIBUTE_DIRECTORY = 0x10;
 
     private const uint ABM_NEW = 0x00;
     private const uint ABM_REMOVE = 0x01;
@@ -473,6 +488,18 @@ public class AddressBarForm : Form
         public int bottom;
     }
 
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+    private struct SHFILEINFO
+    {
+        public IntPtr hIcon;
+        public int iIcon;
+        public uint dwAttributes;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string szDisplayName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 80)]
+        public string szTypeName;
+    }
+
     #endregion
 
     private readonly Screen _screen;
@@ -488,6 +515,9 @@ public class AddressBarForm : Form
     private readonly Button _goButton;
     private readonly Button _settingsButton;
     private readonly Label _addressLabel;
+    private readonly PictureBox _iconBox;
+    private CancellationTokenSource? _iconCts;
+    private static readonly HttpClient _httpClient = new() { Timeout = TimeSpan.FromSeconds(5) };
 
     public AddressBarForm(Screen screen, AppSettings settings, AddressBarManager manager)
     {
@@ -522,6 +552,7 @@ public class AddressBarForm : Form
             ForeColor = GetSystemForeColor()
         };
         _addressBox.KeyDown += AddressBox_KeyDown;
+        _addressBox.TextChanged += AddressBox_TextChanged;
 
         _addressBoxContainer = new Panel
         {
@@ -558,6 +589,14 @@ public class AddressBarForm : Form
         _settingsButton.FlatAppearance.BorderColor = GetBorderColor();
         _settingsButton.Click += SettingsButton_Click;
 
+        _iconBox = new PictureBox
+        {
+            Size = new Size(16, 16),
+            SizeMode = PictureBoxSizeMode.Zoom,
+            BackColor = Color.Transparent
+        };
+
+        Controls.Add(_iconBox);
         Controls.Add(_addressLabel);
         Controls.Add(_addressBoxContainer);
         Controls.Add(_goButton);
@@ -587,18 +626,28 @@ public class AddressBarForm : Form
     {
         UnregisterAppBar();
         SystemEvents.UserPreferenceChanged -= SystemEvents_UserPreferenceChanged;
+        _iconCts?.Cancel();
+        _iconCts?.Dispose();
+        _iconBox.Image?.Dispose();
     }
 
     private void LayoutControls()
     {
         int padding = LogicalToDeviceUnits(6);
+        int iconSize = LogicalToDeviceUnits(16);
+        int iconPadding = LogicalToDeviceUnits(4);
         int labelWidth = LogicalToDeviceUnits(50);
         int buttonWidth = _goButton.Width;
         int settingsWidth = _settingsButton.Width;
 
-        _addressLabel.Location = new Point(padding, (Height - _addressLabel.Height) / 2);
+        // Icon box at the left
+        _iconBox.Size = new Size(iconSize, iconSize);
+        _iconBox.Location = new Point(padding, (Height - iconSize) / 2);
 
-        int textBoxLeft = padding + labelWidth;
+        // Label after icon
+        _addressLabel.Location = new Point(padding + iconSize + iconPadding, (Height - _addressLabel.Height) / 2);
+
+        int textBoxLeft = padding + iconSize + iconPadding + labelWidth;
         int textBoxWidth = Width - textBoxLeft - buttonWidth - settingsWidth - padding * 3;
         int containerHeight = _addressBox.PreferredHeight + 6;
         int controlsY = (Height - containerHeight) / 2;
@@ -898,6 +947,246 @@ public class AddressBarForm : Form
         _settingsButton.FlatAppearance.BorderColor = GetBorderColor();
         ApplyDarkMode();
         Invalidate();
+    }
+
+    #endregion
+
+    #region Icon Extraction (IE-style favicon + shell icons)
+
+    private async void AddressBox_TextChanged(object? sender, EventArgs e)
+    {
+        // Cancel any previous icon fetch
+        _iconCts?.Cancel();
+        _iconCts = new CancellationTokenSource();
+        var token = _iconCts.Token;
+
+        string input = _addressBox.Text.Trim();
+        if (string.IsNullOrEmpty(input))
+        {
+            _iconBox.Image?.Dispose();
+            _iconBox.Image = null;
+            return;
+        }
+
+        // Debounce - wait 400ms after typing stops before fetching
+        try
+        {
+            await Task.Delay(400, token);
+            if (token.IsCancellationRequested) return;
+
+            var icon = await GetIconForInputAsync(input, token);
+
+            if (!token.IsCancellationRequested && !IsDisposed)
+            {
+                var oldImage = _iconBox.Image;
+                _iconBox.Image = icon;
+                oldImage?.Dispose();
+            }
+            else
+            {
+                icon?.Dispose();
+            }
+        }
+        catch (TaskCanceledException) { }
+        catch (ObjectDisposedException) { }
+    }
+
+    private async Task<Image?> GetIconForInputAsync(string input, CancellationToken token)
+    {
+        string expanded = Environment.ExpandEnvironmentVariables(input);
+
+        // 1. Check if it's a local file/folder - use shell icons
+        if (Directory.Exists(expanded))
+        {
+            return GetFileIcon(expanded, isDirectory: true);
+        }
+        if (File.Exists(expanded))
+        {
+            return GetFileIcon(expanded, isDirectory: false);
+        }
+
+        // 2. Check if it's a full URL
+        if (Uri.TryCreate(input, UriKind.Absolute, out var uri) &&
+            (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps))
+        {
+            return await GetFaviconAsync(uri, token);
+        }
+
+        // 3. Looks like a domain without scheme (e.g., "google.com")
+        if (input.Contains('.') && !input.Contains('\\') && !input.Contains('/') && !input.Contains(' '))
+        {
+            if (Uri.TryCreate("https://" + input, UriKind.Absolute, out uri))
+            {
+                return await GetFaviconAsync(uri, token);
+            }
+        }
+
+        // 4. Try to get icon by file extension if it looks like a path
+        if (input.Contains('\\') || input.Contains('/'))
+        {
+            return GetFileIcon(expanded, isDirectory: false);
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Gets the shell icon for a local file or folder using SHGetFileInfo
+    /// </summary>
+    private static Image? GetFileIcon(string path, bool isDirectory)
+    {
+        var shfi = new SHFILEINFO();
+        uint flags = SHGFI_ICON | SHGFI_SMALLICON;
+        uint attributes = isDirectory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+
+        // If file doesn't exist, use SHGFI_USEFILEATTRIBUTES to get icon by extension
+        bool exists = isDirectory ? Directory.Exists(path) : File.Exists(path);
+        if (!exists)
+        {
+            flags |= SHGFI_USEFILEATTRIBUTES;
+        }
+
+        try
+        {
+            IntPtr result = SHGetFileInfo(path, attributes, ref shfi, (uint)Marshal.SizeOf<SHFILEINFO>(), flags);
+
+            if (result != IntPtr.Zero && shfi.hIcon != IntPtr.Zero)
+            {
+                // Clone the icon to a bitmap before destroying the handle
+                using var icon = Icon.FromHandle(shfi.hIcon);
+                var bitmap = icon.ToBitmap();
+                DestroyIcon(shfi.hIcon);
+                return bitmap;
+            }
+        }
+        catch { }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Gets favicon for a website URL the way IE did:
+    /// 1. Parse HTML for link rel="icon" or link rel="shortcut icon"
+    /// 2. Fall back to /favicon.ico at root
+    /// </summary>
+    private static async Task<Image?> GetFaviconAsync(Uri uri, CancellationToken token)
+    {
+        string baseUrl = $"{uri.Scheme}://{uri.Host}";
+
+        try
+        {
+            // Step 1: Try to fetch and parse HTML for favicon link (like IE did)
+            try
+            {
+                using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+                request.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+
+                using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token);
+                if (response.IsSuccessStatusCode && response.Content.Headers.ContentType?.MediaType?.Contains("text/html") == true)
+                {
+                    var html = await response.Content.ReadAsStringAsync(token);
+                    var faviconUrl = ParseFaviconFromHtml(html, baseUrl);
+
+                    if (!string.IsNullOrEmpty(faviconUrl))
+                    {
+                        var icon = await DownloadIconAsync(faviconUrl, token);
+                        if (icon != null) return icon;
+                    }
+                }
+            }
+            catch (TaskCanceledException) { throw; }
+            catch { /* Continue to fallback */ }
+
+            // Step 2: Fall back to /favicon.ico at root (what IE does if no LINK tag)
+            string rootFavicon = $"{baseUrl}/favicon.ico";
+            return await DownloadIconAsync(rootFavicon, token);
+        }
+        catch (TaskCanceledException) { throw; }
+        catch { }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Parses HTML to find favicon URL from link tags (like IE did)
+    /// </summary>
+    private static string? ParseFaviconFromHtml(string html, string baseUrl)
+    {
+        // Look for: <link rel="icon" href="..."> or <link rel="shortcut icon" href="...">
+        // Also handle: <link href="..." rel="icon">
+        var patterns = new[]
+        {
+            @"<link[^>]*rel\s*=\s*[""'](?:shortcut\s+)?icon[""'][^>]*href\s*=\s*[""']([^""']+)[""']",
+            @"<link[^>]*href\s*=\s*[""']([^""']+)[""'][^>]*rel\s*=\s*[""'](?:shortcut\s+)?icon[""']",
+            @"<link[^>]*rel\s*=\s*[""']apple-touch-icon[""'][^>]*href\s*=\s*[""']([^""']+)[""']"
+        };
+
+        foreach (var pattern in patterns)
+        {
+            var match = Regex.Match(html, pattern, RegexOptions.IgnoreCase | RegexOptions.Singleline);
+            if (match.Success)
+            {
+                string href = match.Groups[1].Value;
+                return ResolveUrl(href, baseUrl);
+            }
+        }
+
+        return null;
+    }
+
+    private static string ResolveUrl(string href, string baseUrl)
+    {
+        if (href.StartsWith("//"))
+            return "https:" + href;
+        if (href.StartsWith("/"))
+            return baseUrl + href;
+        if (href.StartsWith("http://") || href.StartsWith("https://"))
+            return href;
+        // Relative URL
+        return baseUrl + "/" + href;
+    }
+
+    /// <summary>
+    /// Downloads and parses an icon file (handles .ico, .png, .gif formats)
+    /// </summary>
+    private static async Task<Image?> DownloadIconAsync(string url, CancellationToken token)
+    {
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            request.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+
+            using var response = await _httpClient.SendAsync(request, token);
+            if (!response.IsSuccessStatusCode || response.Content.Headers.ContentLength == 0)
+                return null;
+
+            var bytes = await response.Content.ReadAsByteArrayAsync(token);
+            if (bytes.Length == 0) return null;
+
+            using var ms = new MemoryStream(bytes);
+
+            // Try loading as .ico first (handles multi-size icon files)
+            try
+            {
+                ms.Position = 0;
+                using var icon = new Icon(ms);
+                return icon.ToBitmap();
+            }
+            catch
+            {
+                // Fall back to Image.FromStream (handles png, gif, jpg, etc.)
+                try
+                {
+                    ms.Position = 0;
+                    return Image.FromStream(ms);
+                }
+                catch { }
+            }
+        }
+        catch (TaskCanceledException) { throw; }
+        catch { }
+
+        return null;
     }
 
     #endregion
