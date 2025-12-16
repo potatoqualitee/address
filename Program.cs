@@ -423,8 +423,7 @@ public class AddressBarManager : ApplicationContext
     {
         try
         {
-            var exePath = System.Reflection.Assembly.GetExecutingAssembly().Location;
-            var iconPath = Path.Combine(Path.GetDirectoryName(exePath)!, "addressbar.ico");
+            var iconPath = Path.Combine(AppContext.BaseDirectory, "addressbar.ico");
             if (File.Exists(iconPath))
                 return new Icon(iconPath);
         }
@@ -434,6 +433,207 @@ public class AddressBarManager : ApplicationContext
 }
 
 #endregion
+
+/// <summary>
+/// Custom dropdown popup for history - uses a borderless Form for reliable display
+/// </summary>
+public class HistoryDropdown : Form
+{
+    private readonly List<(string Path, Image? Icon)> _items = new();
+    private int _hoveredIndex = -1;
+    private const int ItemHeight = 24;
+    private const int IconSize = 16;
+    private const int MaxVisibleItems = 10;
+    private bool _justShown;
+
+    public event EventHandler<string>? ItemSelected;
+
+    public HistoryDropdown()
+    {
+        FormBorderStyle = FormBorderStyle.None;
+        StartPosition = FormStartPosition.Manual;
+        ShowInTaskbar = false;
+        TopMost = true;
+        DoubleBuffered = true;
+        BackColor = IsDarkMode() ? Color.FromArgb(45, 45, 45) : Color.White;
+    }
+
+    public void SetItems(List<(string Path, Image? Icon)> items)
+    {
+        _items.Clear();
+        _items.AddRange(items);
+        _hoveredIndex = -1;
+
+        int visibleCount = Math.Min(items.Count, MaxVisibleItems);
+        if (visibleCount == 0) visibleCount = 1; // Show at least empty state
+        Height = visibleCount * ItemHeight + 2; // +2 for border
+        BackColor = IsDarkMode() ? Color.FromArgb(45, 45, 45) : Color.White;
+        Invalidate();
+    }
+
+    public void SetWidth(int width)
+    {
+        Width = width;
+    }
+
+    public void ShowAt(Point screenLocation)
+    {
+        if (Visible)
+        {
+            Hide();
+            return;
+        }
+
+        Location = screenLocation;
+        _justShown = true;
+        Show();
+
+        // Use a timer to reset the flag after the form is shown
+        var timer = new System.Windows.Forms.Timer { Interval = 100 };
+        timer.Tick += (s, e) =>
+        {
+            _justShown = false;
+            timer.Stop();
+            timer.Dispose();
+        };
+        timer.Start();
+    }
+
+    protected override void OnLostFocus(EventArgs e)
+    {
+        base.OnLostFocus(e);
+        if (!_justShown)
+        {
+            Hide();
+        }
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        bool dark = IsDarkMode();
+
+        // Background
+        using var bgBrush = new SolidBrush(dark ? Color.FromArgb(45, 45, 45) : Color.White);
+        g.FillRectangle(bgBrush, ClientRectangle);
+
+        // Border
+        using var borderPen = new Pen(dark ? Color.FromArgb(70, 70, 70) : Color.FromArgb(200, 200, 200));
+        g.DrawRectangle(borderPen, 0, 0, Width - 1, Height - 1);
+
+        // Items
+        using var textBrush = new SolidBrush(dark ? Color.White : Color.Black);
+        using var hoverBrush = new SolidBrush(dark ? Color.FromArgb(65, 65, 65) : Color.FromArgb(230, 230, 230));
+        using var font = new Font("Segoe UI", 9f);
+
+        if (_items.Count == 0)
+        {
+            // Empty state
+            var emptyRect = new Rectangle(1, 1, Width - 2, ItemHeight);
+            var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
+            using var dimBrush = new SolidBrush(dark ? Color.Gray : Color.DarkGray);
+            g.DrawString("No history", font, dimBrush, emptyRect, sf);
+            return;
+        }
+
+        for (int i = 0; i < _items.Count && i < MaxVisibleItems; i++)
+        {
+            var item = _items[i];
+            int y = 1 + i * ItemHeight;
+            var itemRect = new Rectangle(1, y, Width - 2, ItemHeight);
+
+            // Highlight on hover
+            if (i == _hoveredIndex)
+            {
+                g.FillRectangle(hoverBrush, itemRect);
+            }
+
+            // Icon
+            if (item.Icon != null)
+            {
+                int iconY = y + (ItemHeight - IconSize) / 2;
+                g.DrawImage(item.Icon, new Rectangle(6, iconY, IconSize, IconSize));
+            }
+
+            // Text
+            var textRect = new Rectangle(6 + IconSize + 6, y, Width - IconSize - 18, ItemHeight);
+            var sf = new StringFormat { LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisPath };
+            g.DrawString(item.Path, font, textBrush, textRect, sf);
+        }
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        base.OnMouseMove(e);
+        int index = (e.Y - 1) / ItemHeight;
+        if (index >= 0 && index < _items.Count && index < MaxVisibleItems && index != _hoveredIndex)
+        {
+            _hoveredIndex = index;
+            Invalidate();
+        }
+        else if ((index < 0 || index >= _items.Count) && _hoveredIndex != -1)
+        {
+            _hoveredIndex = -1;
+            Invalidate();
+        }
+    }
+
+    protected override void OnMouseLeave(EventArgs e)
+    {
+        base.OnMouseLeave(e);
+        if (_hoveredIndex != -1)
+        {
+            _hoveredIndex = -1;
+            Invalidate();
+        }
+    }
+
+    protected override void OnMouseClick(MouseEventArgs e)
+    {
+        base.OnMouseClick(e);
+        int index = (e.Y - 1) / ItemHeight;
+        if (index >= 0 && index < _items.Count && index < MaxVisibleItems)
+        {
+            ItemSelected?.Invoke(this, _items[index].Path);
+            Hide();
+        }
+    }
+
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        base.OnKeyDown(e);
+
+        if (e.KeyCode == Keys.Escape)
+        {
+            Hide();
+            e.Handled = true;
+        }
+    }
+
+    protected override bool ShowWithoutActivation => true;
+
+    private static bool IsDarkMode()
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+            var value = key?.GetValue("AppsUseLightTheme");
+            return value is int i && i == 0;
+        }
+        catch { return false; }
+    }
+
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            var cp = base.CreateParams;
+            cp.ExStyle |= 0x00000080; // WS_EX_TOOLWINDOW - don't show in taskbar/alt-tab
+            cp.ClassStyle |= 0x0002; // CS_DROPSHADOW
+            return cp;
+        }
+    }
+}
 
 public class AddressBarForm : Form
 {
@@ -537,8 +737,14 @@ public class AddressBarForm : Form
     private readonly Button _settingsButton;
     private readonly Label _addressLabel;
     private readonly PictureBox _iconBox;
+    private readonly Button _dropdownButton;
+    private readonly HistoryDropdown _historyDropdown;
+    private readonly List<string> _history = new();
+    private readonly Dictionary<string, Image?> _historyIcons = new();
     private CancellationTokenSource? _iconCts;
     private static readonly HttpClient _httpClient = new() { Timeout = TimeSpan.FromSeconds(5) };
+    private const string HistoryRegPath = @"Software\AddressBar\TypedPaths";
+    private const int MaxHistoryItems = 25;
 
     public AddressBarForm(Screen screen, AppSettings settings, AddressBarManager manager)
     {
@@ -617,6 +823,27 @@ public class AddressBarForm : Form
             BackColor = _settings.IconPosition == IconPosition.Inside ? GetTextBoxBackColor() : GetSystemBackColor()
         };
 
+        // Dropdown button - inside the container, no left border, seamless with textbox
+        _dropdownButton = new Button
+        {
+            Text = "▼",
+            FlatStyle = FlatStyle.Flat,
+            Font = new Font("Segoe UI", 7f),
+            BackColor = GetTextBoxBackColor(),
+            ForeColor = GetSystemForeColor(),
+            Cursor = Cursors.Hand,
+            Width = LogicalToDeviceUnits(20),
+            TabStop = false
+        };
+        _dropdownButton.FlatAppearance.BorderSize = 0; // No border at all
+        _dropdownButton.FlatAppearance.MouseOverBackColor = GetDropdownHoverColor();
+        _dropdownButton.FlatAppearance.MouseDownBackColor = GetDropdownHoverColor();
+        _dropdownButton.Click += DropdownButton_Click;
+
+        // History dropdown popup
+        _historyDropdown = new HistoryDropdown();
+        _historyDropdown.ItemSelected += HistoryDropdown_ItemSelected;
+
         // Add icon to the appropriate parent based on settings
         if (_settings.IconPosition == IconPosition.Inside)
         {
@@ -626,6 +853,8 @@ public class AddressBarForm : Form
         {
             Controls.Add(_iconBox);
         }
+
+        _addressBoxContainer.Controls.Add(_dropdownButton);
 
         Controls.Add(_addressLabel);
         Controls.Add(_addressBoxContainer);
@@ -644,6 +873,7 @@ public class AddressBarForm : Form
         SetTextBoxMargins();
         LayoutControls();
         _iconBox.Image = GetDefaultAppIcon();
+        LoadHistory();
     }
 
     private void SetTextBoxMargins()
@@ -670,6 +900,7 @@ public class AddressBarForm : Form
         int labelWidth = LogicalToDeviceUnits(50);
         int buttonWidth = _goButton.Width;
         int settingsWidth = _settingsButton.Width;
+        int dropdownWidth = _dropdownButton.Width;
 
         int containerHeight = _addressBox.PreferredHeight + 6;
         int controlsY = (Height - containerHeight) / 2;
@@ -688,10 +919,14 @@ public class AddressBarForm : Form
             _addressBoxContainer.Location = new Point(textBoxLeft, controlsY);
             _addressBoxContainer.Size = new Size(textBoxWidth, containerHeight);
 
-            // Textbox fills the container (no icon inside)
+            // Dropdown button on the right inside container
+            _dropdownButton.Height = containerHeight - 2;
+            _dropdownButton.Location = new Point(textBoxWidth - dropdownWidth - 1, 0);
+
+            // Textbox fills the container (no icon inside), leaving room for dropdown
             int textBoxY = (containerHeight - _addressBox.PreferredHeight - 2) / 2;
             _addressBox.Location = new Point(4, textBoxY);
-            _addressBox.Width = textBoxWidth - 10;
+            _addressBox.Width = textBoxWidth - dropdownWidth - 10;
         }
         else
         {
@@ -707,11 +942,15 @@ public class AddressBarForm : Form
             // Icon inside container, on the left
             _iconBox.Location = new Point(4, (containerHeight - iconSize - 2) / 2);
 
-            // Textbox after the icon inside container
+            // Dropdown button on the right inside container
+            _dropdownButton.Height = containerHeight - 2;
+            _dropdownButton.Location = new Point(textBoxWidth - dropdownWidth - 1, 0);
+
+            // Textbox after the icon inside container, leaving room for dropdown
             int textBoxY = (containerHeight - _addressBox.PreferredHeight - 2) / 2;
             int textBoxInternalLeft = iconSize + iconPadding + 4;
             _addressBox.Location = new Point(textBoxInternalLeft, textBoxY);
-            _addressBox.Width = textBoxWidth - textBoxInternalLeft - 6;
+            _addressBox.Width = textBoxWidth - textBoxInternalLeft - dropdownWidth - 6;
         }
 
         _goButton.Location = new Point(Width - buttonWidth - settingsWidth - padding * 2, controlsY);
@@ -902,6 +1141,7 @@ public class AddressBarForm : Form
                 (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps))
             {
                 Process.Start(new ProcessStartInfo(input) { UseShellExecute = true });
+                SaveToHistory(input);
                 return;
             }
 
@@ -911,6 +1151,7 @@ public class AddressBarForm : Form
                 if (Uri.TryCreate(url, UriKind.Absolute, out uri))
                 {
                     Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+                    SaveToHistory(input);
                     return;
                 }
             }
@@ -919,15 +1160,18 @@ public class AddressBarForm : Form
             if (Directory.Exists(expandedPath))
             {
                 Process.Start(new ProcessStartInfo("explorer.exe", $"\"{expandedPath}\"") { UseShellExecute = true });
+                SaveToHistory(input);
                 return;
             }
             if (File.Exists(expandedPath))
             {
                 Process.Start(new ProcessStartInfo(expandedPath) { UseShellExecute = true });
+                SaveToHistory(input);
                 return;
             }
 
             Process.Start(new ProcessStartInfo(input) { UseShellExecute = true });
+            SaveToHistory(input);
         }
         catch (Exception ex)
         {
@@ -978,6 +1222,9 @@ public class AddressBarForm : Form
     private static Color GetBorderColor() =>
         IsDarkMode() ? Color.FromArgb(70, 70, 70) : Color.FromArgb(200, 200, 200);
 
+    private static Color GetDropdownHoverColor() =>
+        IsDarkMode() ? Color.FromArgb(60, 60, 60) : Color.FromArgb(220, 220, 220);
+
     private void SystemEvents_UserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
     {
         if (e.Category == UserPreferenceCategory.General)
@@ -994,6 +1241,10 @@ public class AddressBarForm : Form
         _addressBox.ForeColor = GetSystemForeColor();
         _addressBoxContainer.BackColor = GetTextBoxBackColor();
         _iconBox.BackColor = _settings.IconPosition == IconPosition.Inside ? GetTextBoxBackColor() : GetSystemBackColor();
+        _dropdownButton.BackColor = GetTextBoxBackColor();
+        _dropdownButton.ForeColor = GetSystemForeColor();
+        _dropdownButton.FlatAppearance.MouseOverBackColor = GetDropdownHoverColor();
+        _dropdownButton.FlatAppearance.MouseDownBackColor = GetDropdownHoverColor();
         _goButton.BackColor = GetButtonBackColor();
         _goButton.ForeColor = GetSystemForeColor();
         _goButton.FlatAppearance.BorderColor = GetBorderColor();
@@ -1100,8 +1351,7 @@ public class AddressBarForm : Form
     {
         try
         {
-            var exePath = System.Reflection.Assembly.GetExecutingAssembly().Location;
-            var iconPath = Path.Combine(Path.GetDirectoryName(exePath)!, "addressbar.ico");
+            var iconPath = Path.Combine(AppContext.BaseDirectory, "addressbar.ico");
             if (File.Exists(iconPath))
             {
                 using var icon = new Icon(iconPath, 16, 16);
@@ -1362,6 +1612,137 @@ public class AddressBarForm : Form
         catch { }
 
         return null;
+    }
+
+    #endregion
+
+    #region History Management
+
+    private void LoadHistory()
+    {
+        _history.Clear();
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(HistoryRegPath);
+            if (key != null)
+            {
+                // Get all value names and sort them to maintain order
+                var names = key.GetValueNames().OrderBy(n => n).ToList();
+                foreach (var name in names)
+                {
+                    var value = key.GetValue(name) as string;
+                    if (!string.IsNullOrEmpty(value) && !_history.Contains(value))
+                    {
+                        _history.Add(value);
+                    }
+                }
+            }
+        }
+        catch { }
+
+        // Load icons asynchronously for history items
+        _ = LoadHistoryIconsAsync();
+    }
+
+    private async Task LoadHistoryIconsAsync()
+    {
+        foreach (var path in _history.ToList())
+        {
+            if (_historyIcons.ContainsKey(path)) continue;
+
+            try
+            {
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                var icon = await GetIconForInputAsync(path, cts.Token);
+                _historyIcons[path] = icon;
+            }
+            catch
+            {
+                _historyIcons[path] = null;
+            }
+        }
+    }
+
+    private void SaveToHistory(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return;
+
+        // Remove if exists (to move to top)
+        _history.Remove(path);
+        _history.Insert(0, path);
+
+        // Trim to max items
+        while (_history.Count > MaxHistoryItems)
+        {
+            _history.RemoveAt(_history.Count - 1);
+        }
+
+        // Save to registry
+        try
+        {
+            using var key = Registry.CurrentUser.CreateSubKey(HistoryRegPath);
+            if (key != null)
+            {
+                // Clear existing values
+                foreach (var name in key.GetValueNames())
+                {
+                    key.DeleteValue(name, false);
+                }
+
+                // Write new values
+                for (int i = 0; i < _history.Count; i++)
+                {
+                    key.SetValue($"url{i + 1}", _history[i]);
+                }
+            }
+        }
+        catch { }
+
+        // Fetch icon for new entry
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                var icon = await GetIconForInputAsync(path, cts.Token);
+                _historyIcons[path] = icon;
+            }
+            catch
+            {
+                _historyIcons[path] = null;
+            }
+        });
+    }
+
+    private void DropdownButton_Click(object? sender, EventArgs e)
+    {
+        // Build items with icons
+        var items = _history.Select(path =>
+        {
+            _historyIcons.TryGetValue(path, out var icon);
+            return (path, icon);
+        }).ToList();
+
+        _historyDropdown.SetItems(items);
+        _historyDropdown.SetWidth(_addressBoxContainer.Width);
+
+        // Show dropdown below the address box container
+        var screenPoint = _addressBoxContainer.PointToScreen(new Point(0, _addressBoxContainer.Height));
+
+        // For AppBar at top of screen, show below; for bottom, show above
+        if (_settings.DockPosition == DockPosition.Bottom)
+        {
+            screenPoint = _addressBoxContainer.PointToScreen(new Point(0, -_historyDropdown.Height));
+        }
+
+        _historyDropdown.ShowAt(screenPoint);
+    }
+
+    private void HistoryDropdown_ItemSelected(object? sender, string path)
+    {
+        _addressBox.Text = path;
+        _addressBox.SelectAll();
+        _addressBox.Focus();
     }
 
     #endregion
