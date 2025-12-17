@@ -453,6 +453,7 @@ public class AutoCompleteController : IDisposable
     private string _pendingText = "";
     private bool _isAutoAppending;
     private bool _suppressTextChanged;
+    private bool _suppressLostFocus;
     private int _selectedIndex = -1;
     private List<string> _currentItems = new();
     private const int DebounceMs = 150;
@@ -538,7 +539,9 @@ public class AutoCompleteController : IDisposable
         _parent = parent;
         _dropdown = new AutoCompleteDropdown();
         _dropdown.ItemClicked += OnDropdownItemClicked;
+        _dropdown.DismissRequested += OnDropdownDismissed;
         _dropdown.SetOwner(parent.FindForm());
+        _dropdown.SetTargetTextBox(textBox);
 
         _debounceTimer = new System.Windows.Forms.Timer { Interval = DebounceMs };
         _debounceTimer.Tick += OnDebounceTimerTick;
@@ -547,6 +550,12 @@ public class AutoCompleteController : IDisposable
         _textBox.KeyDown += OnKeyDown;
         _textBox.KeyPress += OnKeyPress;
         _textBox.LostFocus += OnLostFocus;
+    }
+
+    private void OnDropdownDismissed(object? sender, EventArgs e)
+    {
+        _selectedIndex = -1;
+        _isAutoAppending = false;
     }
 
     public void Dispose()
@@ -674,14 +683,19 @@ public class AutoCompleteController : IDisposable
 
     private void OnLostFocus(object? sender, EventArgs e)
     {
-        // Delay hiding to allow dropdown clicks to register
-        Task.Delay(150).ContinueWith(_ =>
+        // Ignore if we're in the middle of showing the dropdown
+        if (_suppressLostFocus) return;
+
+        // Small delay to allow dropdown clicks to be processed first
+        // The dropdown won't steal focus due to WS_EX_NOACTIVATE
+        Task.Delay(100).ContinueWith(_ =>
         {
             if (_textBox.IsHandleCreated && !_textBox.IsDisposed)
             {
                 _textBox.BeginInvoke(() =>
                 {
-                    if (!_textBox.Focused && !_dropdown.ContainsFocus)
+                    // Only hide if textbox still doesn't have focus
+                    if (!_textBox.Focused && !_suppressLostFocus)
                     {
                         HideDropdown();
                     }
@@ -919,10 +933,7 @@ public class AutoCompleteController : IDisposable
             return;
         }
 
-        // Auto-append the first match
-        DoAutoAppend(text, filtered[0]);
-
-        // Show dropdown
+        // Show dropdown (no auto-append - let user choose)
         ShowDropdown();
         _dropdown.SetItems(filtered);
     }
@@ -964,7 +975,25 @@ public class AutoCompleteController : IDisposable
             screenPoint = _parent.PointToScreen(new Point(0, _parent.Height));
         }
 
+        // Suppress lost focus events while showing the dropdown
+        _suppressLostFocus = true;
         _dropdown.ShowAt(screenPoint, _parent.Width);
+
+        // Restore focus to textbox and clear suppress flag after a brief delay
+        Task.Delay(50).ContinueWith(_ =>
+        {
+            if (_textBox.IsHandleCreated && !_textBox.IsDisposed)
+            {
+                _textBox.BeginInvoke(() =>
+                {
+                    if (!_textBox.Focused)
+                    {
+                        _textBox.Focus();
+                    }
+                    _suppressLostFocus = false;
+                });
+            }
+        });
     }
 
     private void HideDropdown()
@@ -1007,8 +1036,10 @@ public class AutoCompleteDropdown : Form
     private Form? _owner;
     private readonly System.Windows.Forms.Timer _scrollTimer;
     private int _scrollDirection;
+    private TextBox? _targetTextBox;
 
     public event EventHandler<string>? ItemClicked;
+    public event EventHandler? DismissRequested;
 
     public AutoCompleteDropdown()
     {
@@ -1026,6 +1057,11 @@ public class AutoCompleteDropdown : Form
     public void SetOwner(Form? owner)
     {
         _owner = owner;
+    }
+
+    public void SetTargetTextBox(TextBox? textBox)
+    {
+        _targetTextBox = textBox;
     }
 
     public void SetItems(List<string> items)
@@ -1179,7 +1215,9 @@ public class AutoCompleteDropdown : Form
 
         if (!Visible)
         {
-            Show(_owner);
+            // Show without owner to avoid focus stealing issues
+            // The WS_EX_NOACTIVATE and WS_EX_TOOLWINDOW styles handle the rest
+            Show();
         }
     }
 
@@ -1356,10 +1394,26 @@ public class AutoCompleteDropdown : Form
         get
         {
             var cp = base.CreateParams;
-            cp.ExStyle |= 0x00000080; // WS_EX_TOOLWINDOW
+            cp.ExStyle |= 0x00000080; // WS_EX_TOOLWINDOW - don't show in taskbar/alt-tab
+            cp.ExStyle |= 0x08000000; // WS_EX_NOACTIVATE - never steal focus
             cp.ClassStyle |= 0x0002;  // CS_DROPSHADOW
             return cp;
         }
+    }
+
+    // Prevent activation when clicked
+    private const int WM_MOUSEACTIVATE = 0x0021;
+    private const int MA_NOACTIVATE = 3;
+    private const int WM_NCACTIVATE = 0x0086;
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == WM_MOUSEACTIVATE)
+        {
+            m.Result = (IntPtr)MA_NOACTIVATE;
+            return;
+        }
+        base.WndProc(ref m);
     }
 
     private static bool IsDarkMode()
