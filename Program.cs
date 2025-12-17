@@ -451,12 +451,12 @@ public class AutoCompleteController : IDisposable
     private CancellationTokenSource? _enumCts;
     private Thread? _enumThread;
     private string _pendingText = "";
-    private bool _isAutoAppending;
     private bool _suppressTextChanged;
     private bool _suppressLostFocus;
     private int _selectedIndex = -1;
     private List<string> _currentItems = new();
     private const int DebounceMs = 150;
+    private const int ItemHeight = 22;
     private bool _dockAtBottom;
 
     public event EventHandler<string>? ItemSelected;
@@ -555,7 +555,6 @@ public class AutoCompleteController : IDisposable
     private void OnDropdownDismissed(object? sender, EventArgs e)
     {
         _selectedIndex = -1;
-        _isAutoAppending = false;
     }
 
     public void Dispose()
@@ -620,17 +619,6 @@ public class AutoCompleteController : IDisposable
                     e.Handled = true;
                     e.SuppressKeyPress = true;
                 }
-                else if (_isAutoAppending && _textBox.SelectionLength > 0)
-                {
-                    // Accept the auto-appended text
-                    _suppressTextChanged = true;
-                    _textBox.SelectionStart = _textBox.Text.Length;
-                    _textBox.SelectionLength = 0;
-                    _suppressTextChanged = false;
-                    HideDropdown();
-                    e.Handled = true;
-                    if (e.KeyCode == Keys.Tab) e.SuppressKeyPress = true;
-                }
                 break;
 
             case Keys.Escape:
@@ -655,30 +643,7 @@ public class AutoCompleteController : IDisposable
 
     private void OnKeyPress(object? sender, KeyPressEventArgs e)
     {
-        // When user types a character that matches the auto-appended text, consume it
-        if (_isAutoAppending && _textBox.SelectionLength > 0)
-        {
-            int selStart = _textBox.SelectionStart;
-            if (selStart < _textBox.Text.Length)
-            {
-                char expected = _textBox.Text[selStart];
-                if (char.ToLowerInvariant(e.KeyChar) == char.ToLowerInvariant(expected))
-                {
-                    _suppressTextChanged = true;
-                    _textBox.SelectionStart = selStart + 1;
-                    _textBox.SelectionLength = _textBox.Text.Length - selStart - 1;
-                    _suppressTextChanged = false;
-                    e.Handled = true;
-
-                    // Re-trigger enumeration if this was a path separator
-                    if (e.KeyChar == '\\' || e.KeyChar == '/')
-                    {
-                        _pendingText = _textBox.Text.Substring(0, _textBox.SelectionStart);
-                        StartEnumeration(_pendingText);
-                    }
-                }
-            }
-        }
+        // No special key handling needed - auto-append is disabled
     }
 
     private void OnLostFocus(object? sender, EventArgs e)
@@ -686,18 +651,26 @@ public class AutoCompleteController : IDisposable
         // Ignore if we're in the middle of showing the dropdown
         if (_suppressLostFocus) return;
 
+        // Check if mouse is over the dropdown - if so, don't hide
+        if (_dropdown.Visible && _dropdown.Bounds.Contains(Control.MousePosition))
+        {
+            return;
+        }
+
         // Small delay to allow dropdown clicks to be processed first
-        // The dropdown won't steal focus due to WS_EX_NOACTIVATE
-        Task.Delay(100).ContinueWith(_ =>
+        Task.Delay(150).ContinueWith(_ =>
         {
             if (_textBox.IsHandleCreated && !_textBox.IsDisposed)
             {
                 _textBox.BeginInvoke(() =>
                 {
-                    // Only hide if textbox still doesn't have focus
+                    // Only hide if textbox still doesn't have focus and mouse isn't over dropdown
                     if (!_textBox.Focused && !_suppressLostFocus)
                     {
-                        HideDropdown();
+                        if (!_dropdown.Visible || !_dropdown.Bounds.Contains(Control.MousePosition))
+                        {
+                            HideDropdown();
+                        }
                     }
                 });
             }
@@ -715,7 +688,6 @@ public class AutoCompleteController : IDisposable
         _textBox.Text = item;
         _textBox.SelectionStart = item.Length;
         _suppressTextChanged = false;
-        _isAutoAppending = false;
         HideDropdown();
         ItemSelected?.Invoke(this, item);
 
@@ -938,30 +910,11 @@ public class AutoCompleteController : IDisposable
         _dropdown.SetItems(filtered);
     }
 
-    private void DoAutoAppend(string typed, string match)
-    {
-        if (match.Length <= typed.Length) return;
-        if (!_textBox.Focused) return;
-
-        // Only auto-append if the match starts with what was typed
-        if (!match.StartsWith(typed, StringComparison.OrdinalIgnoreCase)) return;
-
-        _suppressTextChanged = true;
-        _isAutoAppending = true;
-
-        int caretPos = typed.Length;
-        _textBox.Text = match;
-        _textBox.SelectionStart = caretPos;
-        _textBox.SelectionLength = match.Length - caretPos;
-
-        _suppressTextChanged = false;
-    }
-
     private void ShowDropdown()
     {
         if (_currentItems.Count == 0) return;
 
-        int dropdownHeight = Math.Min(_currentItems.Count, 12) * 22 + 2;
+        int dropdownHeight = Math.Min(_currentItems.Count, 12) * ItemHeight + 2;
         Point screenPoint;
 
         if (_dockAtBottom)
@@ -971,8 +924,8 @@ public class AutoCompleteController : IDisposable
         }
         else
         {
-            // Show dropdown below the textbox when docked at top
-            screenPoint = _parent.PointToScreen(new Point(0, _parent.Height));
+            // Show dropdown below the textbox when docked at top - flush with bottom edge
+            screenPoint = _parent.PointToScreen(new Point(0, _parent.Height - 1));
         }
 
         // Suppress lost focus events while showing the dropdown
@@ -1000,7 +953,6 @@ public class AutoCompleteController : IDisposable
     {
         _dropdown.Hide();
         _selectedIndex = -1;
-        _isAutoAppending = false;
     }
 
     public void ClearCache()
