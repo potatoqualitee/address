@@ -914,18 +914,23 @@ public class AutoCompleteController : IDisposable
     {
         if (_currentItems.Count == 0) return;
 
+        // Get the form's screen bounds - we want to position relative to the form, not the container
+        var form = _parent.FindForm();
+        if (form == null) return;
+
         int dropdownHeight = Math.Min(_currentItems.Count, 12) * ItemHeight + 2;
+        int x = _parent.PointToScreen(new Point(0, 0)).X;  // X aligned with container
         Point screenPoint;
 
         if (_dockAtBottom)
         {
-            // Show dropdown above the textbox when docked at bottom
-            screenPoint = _parent.PointToScreen(new Point(0, -dropdownHeight));
+            // Show dropdown above the form when docked at bottom
+            screenPoint = new Point(x, form.Bounds.Top - dropdownHeight);
         }
         else
         {
-            // Show dropdown below the textbox when docked at top - flush with bottom edge
-            screenPoint = _parent.PointToScreen(new Point(0, _parent.Height - 1));
+            // Show dropdown below the form when docked at top
+            screenPoint = new Point(x, form.Bounds.Bottom);
         }
 
         // Suppress lost focus events while showing the dropdown
@@ -1348,7 +1353,7 @@ public class AutoCompleteDropdown : Form
             var cp = base.CreateParams;
             cp.ExStyle |= 0x00000080; // WS_EX_TOOLWINDOW - don't show in taskbar/alt-tab
             cp.ExStyle |= 0x08000000; // WS_EX_NOACTIVATE - never steal focus
-            cp.ClassStyle |= 0x0002;  // CS_DROPSHADOW
+            // No drop shadow - it creates a visual gap between dropdown and textbox
             return cp;
         }
     }
