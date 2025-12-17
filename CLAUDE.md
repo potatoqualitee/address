@@ -1,4 +1,4 @@
-# Address Bar
+# Bring back the Address bar
 
 Windows address bar application built with .NET 8 WinForms.
 

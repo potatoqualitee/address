@@ -1,6 +1,6 @@
-# Address Bar
+# Bring back the Address bar
 
-A Windows 11 recreation of the classic Address Bar taskbar toolbar, built with C# WinForms.
+A Windows 11 recreation of the classic Address bar taskbar toolbar, built with C# WinForms.
 
 ![.NET 8](https://img.shields.io/badge/.NET-8.0-512BD4)
 ![Windows](https://img.shields.io/badge/Windows-10%2F11-0078D6)

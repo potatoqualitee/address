@@ -16,8 +16,8 @@
     <FileVersion>1.0.2.0</FileVersion>
     <Company>Chrissy LeMaire</Company>
     <Authors>Chrissy LeMaire</Authors>
-    <Product>Address Bar</Product>
-    <Description>Windows 11 Address Bar AppBar - Classic taskbar toolbar recreated</Description>
+    <Product>Bring back the Address bar</Product>
+    <Description>Bring back the Address bar - Windows 11 recreation of the classic taskbar toolbar</Description>
     <Copyright>Copyright (c) 2025 Chrissy LeMaire</Copyright>
   </PropertyGroup>
 
