@@ -434,6 +434,962 @@ public class AddressBarManager : ApplicationContext
 
 #endregion
 
+#region AutoComplete System
+
+/// <summary>
+/// Explorer-style autocomplete system with background threading, hierarchical expansion,
+/// caching, inline auto-append, and smooth dropdown rendering.
+/// </summary>
+public class AutoCompleteController : IDisposable
+{
+    private readonly TextBox _textBox;
+    private readonly Control _parent;
+    private readonly AutoCompleteDropdown _dropdown;
+    private readonly Dictionary<string, List<string>> _cache = new();
+    private readonly object _cacheLock = new();
+    private readonly System.Windows.Forms.Timer _debounceTimer;
+    private CancellationTokenSource? _enumCts;
+    private Thread? _enumThread;
+    private string _pendingText = "";
+    private bool _isAutoAppending;
+    private bool _suppressTextChanged;
+    private int _selectedIndex = -1;
+    private List<string> _currentItems = new();
+    private const int DebounceMs = 150;
+    private bool _dockAtBottom;
+
+    public event EventHandler<string>? ItemSelected;
+
+    /// <summary>
+    /// Set to true when the address bar is docked at the bottom of the screen
+    /// </summary>
+    public bool DockAtBottom
+    {
+        get => _dockAtBottom;
+        set => _dockAtBottom = value;
+    }
+
+    /// <summary>
+    /// Preload common directories into cache for instant response
+    /// </summary>
+    public void PreloadCommonPaths()
+    {
+        // Fire and forget - preload in background
+        Task.Run(() =>
+        {
+            try
+            {
+                // Preload C:\
+                PreloadDirectory("C:\\");
+
+                // Preload user directories
+                var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                if (!string.IsNullOrEmpty(userProfile))
+                {
+                    PreloadDirectory(userProfile + "\\");
+                }
+
+                // Preload common user folders
+                PreloadDirectory(Environment.GetFolderPath(Environment.SpecialFolder.Desktop) + "\\");
+                PreloadDirectory(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments) + "\\");
+            }
+            catch { }
+        });
+    }
+
+    private void PreloadDirectory(string dirPath)
+    {
+        if (string.IsNullOrEmpty(dirPath) || !Directory.Exists(dirPath)) return;
+
+        var key = dirPath.ToLowerInvariant();
+        lock (_cacheLock)
+        {
+            if (_cache.ContainsKey(key)) return; // Already cached
+        }
+
+        var items = new List<string>();
+        try
+        {
+            // Enumerate directories first
+            foreach (var dir in Directory.EnumerateDirectories(dirPath))
+            {
+                items.Add(dir);
+            }
+            // Then files
+            foreach (var file in Directory.EnumerateFiles(dirPath))
+            {
+                items.Add(file);
+            }
+        }
+        catch { }
+
+        if (items.Count > 0)
+        {
+            lock (_cacheLock)
+            {
+                _cache[key] = items;
+            }
+        }
+    }
+
+    public AutoCompleteController(TextBox textBox, Control parent)
+    {
+        _textBox = textBox;
+        _parent = parent;
+        _dropdown = new AutoCompleteDropdown();
+        _dropdown.ItemClicked += OnDropdownItemClicked;
+        _dropdown.SetOwner(parent.FindForm());
+
+        _debounceTimer = new System.Windows.Forms.Timer { Interval = DebounceMs };
+        _debounceTimer.Tick += OnDebounceTimerTick;
+
+        _textBox.TextChanged += OnTextChanged;
+        _textBox.KeyDown += OnKeyDown;
+        _textBox.KeyPress += OnKeyPress;
+        _textBox.LostFocus += OnLostFocus;
+    }
+
+    public void Dispose()
+    {
+        _debounceTimer.Stop();
+        _debounceTimer.Dispose();
+        _enumCts?.Cancel();
+        _enumCts?.Dispose();
+        _dropdown.Dispose();
+    }
+
+    private void OnTextChanged(object? sender, EventArgs e)
+    {
+        if (_suppressTextChanged) return;
+
+        _debounceTimer.Stop();
+        _debounceTimer.Start();
+    }
+
+    private void OnDebounceTimerTick(object? sender, EventArgs e)
+    {
+        _debounceTimer.Stop();
+        _pendingText = _textBox.Text;
+        StartEnumeration(_pendingText);
+    }
+
+    private void OnKeyDown(object? sender, KeyEventArgs e)
+    {
+        if (!_dropdown.Visible)
+        {
+            // Open dropdown on Alt+Down or when we have items
+            if (e.KeyCode == Keys.Down && e.Alt)
+            {
+                if (_currentItems.Count > 0)
+                {
+                    ShowDropdown();
+                    e.Handled = true;
+                }
+            }
+            return;
+        }
+
+        switch (e.KeyCode)
+        {
+            case Keys.Down:
+                _selectedIndex = Math.Min(_selectedIndex + 1, _currentItems.Count - 1);
+                _dropdown.SetSelectedIndex(_selectedIndex);
+                e.Handled = true;
+                break;
+
+            case Keys.Up:
+                _selectedIndex = Math.Max(_selectedIndex - 1, -1);
+                _dropdown.SetSelectedIndex(_selectedIndex);
+                e.Handled = true;
+                break;
+
+            case Keys.Enter:
+            case Keys.Tab:
+                if (_selectedIndex >= 0 && _selectedIndex < _currentItems.Count)
+                {
+                    AcceptCompletion(_currentItems[_selectedIndex]);
+                    e.Handled = true;
+                    e.SuppressKeyPress = true;
+                }
+                else if (_isAutoAppending && _textBox.SelectionLength > 0)
+                {
+                    // Accept the auto-appended text
+                    _suppressTextChanged = true;
+                    _textBox.SelectionStart = _textBox.Text.Length;
+                    _textBox.SelectionLength = 0;
+                    _suppressTextChanged = false;
+                    HideDropdown();
+                    e.Handled = true;
+                    if (e.KeyCode == Keys.Tab) e.SuppressKeyPress = true;
+                }
+                break;
+
+            case Keys.Escape:
+                HideDropdown();
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+                break;
+
+            case Keys.PageDown:
+                _selectedIndex = Math.Min(_selectedIndex + 10, _currentItems.Count - 1);
+                _dropdown.SetSelectedIndex(_selectedIndex);
+                e.Handled = true;
+                break;
+
+            case Keys.PageUp:
+                _selectedIndex = Math.Max(_selectedIndex - 10, 0);
+                _dropdown.SetSelectedIndex(_selectedIndex);
+                e.Handled = true;
+                break;
+        }
+    }
+
+    private void OnKeyPress(object? sender, KeyPressEventArgs e)
+    {
+        // When user types a character that matches the auto-appended text, consume it
+        if (_isAutoAppending && _textBox.SelectionLength > 0)
+        {
+            int selStart = _textBox.SelectionStart;
+            if (selStart < _textBox.Text.Length)
+            {
+                char expected = _textBox.Text[selStart];
+                if (char.ToLowerInvariant(e.KeyChar) == char.ToLowerInvariant(expected))
+                {
+                    _suppressTextChanged = true;
+                    _textBox.SelectionStart = selStart + 1;
+                    _textBox.SelectionLength = _textBox.Text.Length - selStart - 1;
+                    _suppressTextChanged = false;
+                    e.Handled = true;
+
+                    // Re-trigger enumeration if this was a path separator
+                    if (e.KeyChar == '\\' || e.KeyChar == '/')
+                    {
+                        _pendingText = _textBox.Text.Substring(0, _textBox.SelectionStart);
+                        StartEnumeration(_pendingText);
+                    }
+                }
+            }
+        }
+    }
+
+    private void OnLostFocus(object? sender, EventArgs e)
+    {
+        // Delay hiding to allow dropdown clicks to register
+        Task.Delay(150).ContinueWith(_ =>
+        {
+            if (_textBox.IsHandleCreated && !_textBox.IsDisposed)
+            {
+                _textBox.BeginInvoke(() =>
+                {
+                    if (!_textBox.Focused && !_dropdown.ContainsFocus)
+                    {
+                        HideDropdown();
+                    }
+                });
+            }
+        });
+    }
+
+    private void OnDropdownItemClicked(object? sender, string item)
+    {
+        AcceptCompletion(item);
+    }
+
+    private void AcceptCompletion(string item)
+    {
+        _suppressTextChanged = true;
+        _textBox.Text = item;
+        _textBox.SelectionStart = item.Length;
+        _suppressTextChanged = false;
+        _isAutoAppending = false;
+        HideDropdown();
+        ItemSelected?.Invoke(this, item);
+
+        // If it's a directory, trigger new enumeration for contents
+        if (Directory.Exists(item) && !item.EndsWith("\\"))
+        {
+            _suppressTextChanged = true;
+            _textBox.Text = item + "\\";
+            _textBox.SelectionStart = _textBox.Text.Length;
+            _suppressTextChanged = false;
+            _pendingText = _textBox.Text;
+            StartEnumeration(_pendingText);
+        }
+    }
+
+    private void StartEnumeration(string text)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            HideDropdown();
+            return;
+        }
+
+        // Cancel any ongoing enumeration
+        _enumCts?.Cancel();
+        _enumCts = new CancellationTokenSource();
+        var token = _enumCts.Token;
+
+        // Check if this is a path-based input
+        bool isPath = text.Contains('\\') || text.Contains('/') ||
+                      (text.Length >= 2 && text[1] == ':');
+
+        if (!isPath)
+        {
+            // For non-paths, just hide the dropdown
+            HideDropdown();
+            return;
+        }
+
+        // Determine the directory prefix to enumerate
+        string prefix = GetDirectoryPrefix(text);
+
+        // Check cache first
+        List<string>? cachedItems = null;
+        lock (_cacheLock)
+        {
+            if (_cache.TryGetValue(prefix.ToLowerInvariant(), out var cached))
+            {
+                cachedItems = cached;
+            }
+        }
+
+        if (cachedItems != null)
+        {
+            // Filter cached results on UI thread
+            FilterAndShowResults(text, cachedItems);
+        }
+        else
+        {
+            // Enumerate in background thread
+            var capturedPrefix = prefix;
+            var capturedText = text;
+
+            _enumThread = new Thread(() => EnumerateDirectory(capturedPrefix, capturedText, token))
+            {
+                IsBackground = true,
+                Priority = ThreadPriority.BelowNormal
+            };
+            _enumThread.Start();
+        }
+    }
+
+    private static string GetDirectoryPrefix(string text)
+    {
+        // Find the directory part of the path
+        int lastSep = Math.Max(text.LastIndexOf('\\'), text.LastIndexOf('/'));
+
+        if (lastSep >= 0)
+        {
+            return text.Substring(0, lastSep + 1);
+        }
+
+        // Drive letter only (e.g., "C:")
+        if (text.Length >= 2 && text[1] == ':')
+        {
+            return text.Substring(0, 2) + "\\";
+        }
+
+        return text;
+    }
+
+    private void EnumerateDirectory(string prefix, string originalText, CancellationToken token)
+    {
+        var items = new List<string>();
+        int batchCount = 0;
+        const int BatchSize = 20; // Show results incrementally
+
+        try
+        {
+            string dirPath = prefix;
+            if (!Directory.Exists(dirPath))
+            {
+                dirPath = Path.GetDirectoryName(prefix) ?? prefix;
+            }
+
+            if (Directory.Exists(dirPath))
+            {
+                // Enumerate directories first (faster, more useful for navigation)
+                try
+                {
+                    foreach (var dir in Directory.EnumerateDirectories(dirPath))
+                    {
+                        if (token.IsCancellationRequested) return;
+                        items.Add(dir);
+                        batchCount++;
+
+                        // Show first batch quickly for responsiveness
+                        if (batchCount == BatchSize)
+                        {
+                            SendPartialResults(originalText, items, token);
+                        }
+                    }
+                }
+                catch (UnauthorizedAccessException) { }
+                catch (IOException) { }
+
+                // Then files
+                try
+                {
+                    foreach (var file in Directory.EnumerateFiles(dirPath))
+                    {
+                        if (token.IsCancellationRequested) return;
+                        items.Add(file);
+                    }
+                }
+                catch (UnauthorizedAccessException) { }
+                catch (IOException) { }
+            }
+
+            // Enumerate drives if at root
+            if (string.IsNullOrEmpty(prefix) || prefix == "\\" || prefix.Length <= 3)
+            {
+                try
+                {
+                    foreach (var drive in DriveInfo.GetDrives())
+                    {
+                        if (token.IsCancellationRequested) return;
+                        if (drive.IsReady)
+                        {
+                            items.Add(drive.Name);
+                        }
+                    }
+                }
+                catch { }
+            }
+        }
+        catch (Exception)
+        {
+            // Ignore enumeration errors
+        }
+
+        if (token.IsCancellationRequested) return;
+
+        // Cache results
+        lock (_cacheLock)
+        {
+            _cache[prefix.ToLowerInvariant()] = items;
+        }
+
+        // Update UI on main thread with final results
+        if (_textBox.IsHandleCreated && !_textBox.IsDisposed)
+        {
+            _textBox.BeginInvoke(() =>
+            {
+                if (!token.IsCancellationRequested)
+                {
+                    FilterAndShowResults(originalText, items);
+                }
+            });
+        }
+    }
+
+    private void SendPartialResults(string text, List<string> items, CancellationToken token)
+    {
+        if (token.IsCancellationRequested) return;
+        if (!_textBox.IsHandleCreated || _textBox.IsDisposed) return;
+
+        // Make a copy for thread safety
+        var itemsCopy = items.ToList();
+
+        _textBox.BeginInvoke(() =>
+        {
+            if (!token.IsCancellationRequested)
+            {
+                FilterAndShowResults(text, itemsCopy);
+            }
+        });
+    }
+
+    private void FilterAndShowResults(string text, List<string> items)
+    {
+        // Filter items that match the current text
+        var filtered = items
+            .Where(item => item.StartsWith(text, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(item => item, StringComparer.OrdinalIgnoreCase)
+            .Take(15)
+            .ToList();
+
+        _currentItems = filtered;
+        _selectedIndex = -1;
+
+        if (filtered.Count == 0)
+        {
+            HideDropdown();
+            return;
+        }
+
+        // Auto-append the first match
+        DoAutoAppend(text, filtered[0]);
+
+        // Show dropdown
+        ShowDropdown();
+        _dropdown.SetItems(filtered);
+    }
+
+    private void DoAutoAppend(string typed, string match)
+    {
+        if (match.Length <= typed.Length) return;
+        if (!_textBox.Focused) return;
+
+        // Only auto-append if the match starts with what was typed
+        if (!match.StartsWith(typed, StringComparison.OrdinalIgnoreCase)) return;
+
+        _suppressTextChanged = true;
+        _isAutoAppending = true;
+
+        int caretPos = typed.Length;
+        _textBox.Text = match;
+        _textBox.SelectionStart = caretPos;
+        _textBox.SelectionLength = match.Length - caretPos;
+
+        _suppressTextChanged = false;
+    }
+
+    private void ShowDropdown()
+    {
+        if (_currentItems.Count == 0) return;
+
+        int dropdownHeight = Math.Min(_currentItems.Count, 12) * 22 + 2;
+        Point screenPoint;
+
+        if (_dockAtBottom)
+        {
+            // Show dropdown above the textbox when docked at bottom
+            screenPoint = _parent.PointToScreen(new Point(0, -dropdownHeight));
+        }
+        else
+        {
+            // Show dropdown below the textbox when docked at top
+            screenPoint = _parent.PointToScreen(new Point(0, _parent.Height));
+        }
+
+        _dropdown.ShowAt(screenPoint, _parent.Width);
+    }
+
+    private void HideDropdown()
+    {
+        _dropdown.Hide();
+        _selectedIndex = -1;
+        _isAutoAppending = false;
+    }
+
+    public void ClearCache()
+    {
+        lock (_cacheLock)
+        {
+            _cache.Clear();
+        }
+    }
+
+    public void RefreshCache(string prefix)
+    {
+        lock (_cacheLock)
+        {
+            _cache.Remove(prefix.ToLowerInvariant());
+        }
+    }
+}
+
+/// <summary>
+/// Smooth autocomplete dropdown with virtual rendering for performance
+/// </summary>
+public class AutoCompleteDropdown : Form
+{
+    private List<string> _items = new();
+    private int _selectedIndex = -1;
+    private int _hoveredIndex = -1;
+    private int _scrollOffset;
+    private const int ItemHeight = 22;
+    private const int MaxVisibleItems = 12;
+    private const int IconSize = 16;
+    private readonly Dictionary<string, Image?> _iconCache = new();
+    private Form? _owner;
+    private readonly System.Windows.Forms.Timer _scrollTimer;
+    private int _scrollDirection;
+
+    public event EventHandler<string>? ItemClicked;
+
+    public AutoCompleteDropdown()
+    {
+        FormBorderStyle = FormBorderStyle.None;
+        StartPosition = FormStartPosition.Manual;
+        ShowInTaskbar = false;
+        TopMost = true;
+        DoubleBuffered = true;
+        SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint, true);
+
+        _scrollTimer = new System.Windows.Forms.Timer { Interval = 50 };
+        _scrollTimer.Tick += OnScrollTimerTick;
+    }
+
+    public void SetOwner(Form? owner)
+    {
+        _owner = owner;
+    }
+
+    public void SetItems(List<string> items)
+    {
+        _items = items;
+        _scrollOffset = 0;
+        _hoveredIndex = -1;
+
+        int visibleCount = Math.Min(items.Count, MaxVisibleItems);
+        Height = visibleCount * ItemHeight + 2;
+
+        // Pre-fetch icons for visible items in background
+        Task.Run(() => PreloadIcons(items.Take(MaxVisibleItems + 5)));
+
+        Invalidate();
+    }
+
+    public void SetSelectedIndex(int index)
+    {
+        if (index < 0) index = -1;
+        if (index >= _items.Count) index = _items.Count - 1;
+
+        _selectedIndex = index;
+
+        // Ensure selected item is visible
+        if (index >= 0)
+        {
+            if (index < _scrollOffset)
+            {
+                _scrollOffset = index;
+            }
+            else if (index >= _scrollOffset + MaxVisibleItems)
+            {
+                _scrollOffset = index - MaxVisibleItems + 1;
+            }
+        }
+
+        Invalidate();
+    }
+
+    private void PreloadIcons(IEnumerable<string> paths)
+    {
+        foreach (var path in paths)
+        {
+            if (_iconCache.ContainsKey(path)) continue;
+
+            try
+            {
+                var icon = GetPathIcon(path);
+                lock (_iconCache)
+                {
+                    _iconCache[path] = icon;
+                }
+            }
+            catch
+            {
+                lock (_iconCache)
+                {
+                    _iconCache[path] = null;
+                }
+            }
+        }
+
+        if (IsHandleCreated && !IsDisposed)
+        {
+            BeginInvoke(Invalidate);
+        }
+    }
+
+    private static Image? GetPathIcon(string path)
+    {
+        try
+        {
+            bool isDir = Directory.Exists(path);
+            if (isDir)
+            {
+                // Use shell icon for folders
+                return GetShellIcon(path, true);
+            }
+            else if (File.Exists(path))
+            {
+                using var icon = Icon.ExtractAssociatedIcon(path);
+                return icon?.ToBitmap();
+            }
+            else
+            {
+                // Get icon by extension
+                return GetShellIcon(path, false);
+            }
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    [DllImport("shell32.dll", CharSet = CharSet.Auto)]
+    private static extern IntPtr SHGetFileInfo(string pszPath, uint dwFileAttributes,
+        ref SHFILEINFO psfi, uint cbSizeFileInfo, uint uFlags);
+
+    [DllImport("user32.dll")]
+    private static extern bool DestroyIcon(IntPtr hIcon);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+    private struct SHFILEINFO
+    {
+        public IntPtr hIcon;
+        public int iIcon;
+        public uint dwAttributes;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string szDisplayName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 80)]
+        public string szTypeName;
+    }
+
+    private const uint SHGFI_ICON = 0x100;
+    private const uint SHGFI_SMALLICON = 0x1;
+    private const uint SHGFI_USEFILEATTRIBUTES = 0x10;
+    private const uint FILE_ATTRIBUTE_DIRECTORY = 0x10;
+    private const uint FILE_ATTRIBUTE_NORMAL = 0x80;
+
+    private static Image? GetShellIcon(string path, bool isDirectory)
+    {
+        var shfi = new SHFILEINFO();
+        uint flags = SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES;
+        uint attrs = isDirectory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+
+        IntPtr result = SHGetFileInfo(path, attrs, ref shfi, (uint)Marshal.SizeOf<SHFILEINFO>(), flags);
+
+        if (result != IntPtr.Zero && shfi.hIcon != IntPtr.Zero)
+        {
+            try
+            {
+                using var icon = Icon.FromHandle(shfi.hIcon);
+                return icon.ToBitmap();
+            }
+            finally
+            {
+                DestroyIcon(shfi.hIcon);
+            }
+        }
+
+        return null;
+    }
+
+    public void ShowAt(Point screenLocation, int width)
+    {
+        Location = screenLocation;
+        Width = width;
+        BackColor = IsDarkMode() ? Color.FromArgb(45, 45, 45) : Color.White;
+
+        if (!Visible)
+        {
+            Show(_owner);
+        }
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.HighSpeed;
+        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+
+        bool dark = IsDarkMode();
+
+        // Background
+        using var bgBrush = new SolidBrush(dark ? Color.FromArgb(45, 45, 45) : Color.White);
+        g.FillRectangle(bgBrush, ClientRectangle);
+
+        // Border
+        using var borderPen = new Pen(dark ? Color.FromArgb(70, 70, 70) : Color.FromArgb(200, 200, 200));
+        g.DrawRectangle(borderPen, 0, 0, Width - 1, Height - 1);
+
+        if (_items.Count == 0) return;
+
+        using var textBrush = new SolidBrush(dark ? Color.White : Color.Black);
+        using var selectedBrush = new SolidBrush(dark ? Color.FromArgb(0, 120, 215) : Color.FromArgb(0, 120, 215));
+        using var selectedTextBrush = new SolidBrush(Color.White);
+        using var hoverBrush = new SolidBrush(dark ? Color.FromArgb(65, 65, 65) : Color.FromArgb(230, 230, 230));
+        using var font = new Font("Segoe UI", 9f);
+
+        int visibleCount = Math.Min(_items.Count - _scrollOffset, MaxVisibleItems);
+
+        for (int i = 0; i < visibleCount; i++)
+        {
+            int itemIndex = _scrollOffset + i;
+            if (itemIndex >= _items.Count) break;
+
+            var item = _items[itemIndex];
+            int y = 1 + i * ItemHeight;
+            var itemRect = new Rectangle(1, y, Width - 2, ItemHeight);
+
+            // Selection/hover highlight
+            bool isSelected = itemIndex == _selectedIndex;
+            bool isHovered = itemIndex == _hoveredIndex;
+
+            if (isSelected)
+            {
+                g.FillRectangle(selectedBrush, itemRect);
+            }
+            else if (isHovered)
+            {
+                g.FillRectangle(hoverBrush, itemRect);
+            }
+
+            // Icon
+            Image? icon = null;
+            lock (_iconCache)
+            {
+                _iconCache.TryGetValue(item, out icon);
+            }
+
+            int textX = 6;
+            if (icon != null)
+            {
+                int iconY = y + (ItemHeight - IconSize) / 2;
+                g.DrawImage(icon, new Rectangle(6, iconY, IconSize, IconSize));
+                textX = 6 + IconSize + 4;
+            }
+
+            // Text - show just the filename part bolded if it's a path
+            var textRect = new Rectangle(textX, y, Width - textX - 6, ItemHeight);
+            var sf = new StringFormat
+            {
+                LineAlignment = StringAlignment.Center,
+                Trimming = StringTrimming.EllipsisPath,
+                FormatFlags = StringFormatFlags.NoWrap
+            };
+
+            g.DrawString(item, font, isSelected ? selectedTextBrush : textBrush, textRect, sf);
+        }
+
+        // Scroll indicators if needed
+        if (_scrollOffset > 0)
+        {
+            // Up arrow indicator
+            using var arrowBrush = new SolidBrush(dark ? Color.Gray : Color.DarkGray);
+            var upArrow = new Point[] {
+                new Point(Width / 2 - 5, 8),
+                new Point(Width / 2 + 5, 8),
+                new Point(Width / 2, 3)
+            };
+            g.FillPolygon(arrowBrush, upArrow);
+        }
+
+        if (_scrollOffset + MaxVisibleItems < _items.Count)
+        {
+            // Down arrow indicator
+            using var arrowBrush = new SolidBrush(dark ? Color.Gray : Color.DarkGray);
+            var downArrow = new Point[] {
+                new Point(Width / 2 - 5, Height - 8),
+                new Point(Width / 2 + 5, Height - 8),
+                new Point(Width / 2, Height - 3)
+            };
+            g.FillPolygon(arrowBrush, downArrow);
+        }
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        base.OnMouseMove(e);
+
+        int index = _scrollOffset + (e.Y - 1) / ItemHeight;
+        if (index >= 0 && index < _items.Count && index != _hoveredIndex)
+        {
+            _hoveredIndex = index;
+            Invalidate();
+        }
+
+        // Auto-scroll when near edges
+        if (e.Y < 20 && _scrollOffset > 0)
+        {
+            _scrollDirection = -1;
+            if (!_scrollTimer.Enabled) _scrollTimer.Start();
+        }
+        else if (e.Y > Height - 20 && _scrollOffset + MaxVisibleItems < _items.Count)
+        {
+            _scrollDirection = 1;
+            if (!_scrollTimer.Enabled) _scrollTimer.Start();
+        }
+        else
+        {
+            _scrollTimer.Stop();
+        }
+    }
+
+    private void OnScrollTimerTick(object? sender, EventArgs e)
+    {
+        _scrollOffset = Math.Max(0, Math.Min(_items.Count - MaxVisibleItems, _scrollOffset + _scrollDirection));
+        Invalidate();
+    }
+
+    protected override void OnMouseLeave(EventArgs e)
+    {
+        base.OnMouseLeave(e);
+        _scrollTimer.Stop();
+        if (_hoveredIndex != -1)
+        {
+            _hoveredIndex = -1;
+            Invalidate();
+        }
+    }
+
+    protected override void OnMouseClick(MouseEventArgs e)
+    {
+        base.OnMouseClick(e);
+
+        int index = _scrollOffset + (e.Y - 1) / ItemHeight;
+        if (index >= 0 && index < _items.Count)
+        {
+            ItemClicked?.Invoke(this, _items[index]);
+        }
+    }
+
+    protected override void OnMouseWheel(MouseEventArgs e)
+    {
+        base.OnMouseWheel(e);
+
+        int delta = e.Delta > 0 ? -3 : 3;
+        _scrollOffset = Math.Max(0, Math.Min(_items.Count - MaxVisibleItems, _scrollOffset + delta));
+        Invalidate();
+    }
+
+    protected override bool ShowWithoutActivation => true;
+
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            var cp = base.CreateParams;
+            cp.ExStyle |= 0x00000080; // WS_EX_TOOLWINDOW
+            cp.ClassStyle |= 0x0002;  // CS_DROPSHADOW
+            return cp;
+        }
+    }
+
+    private static bool IsDarkMode()
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+            var value = key?.GetValue("AppsUseLightTheme");
+            return value is int i && i == 0;
+        }
+        catch { return false; }
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _scrollTimer.Dispose();
+            foreach (var icon in _iconCache.Values)
+            {
+                icon?.Dispose();
+            }
+            _iconCache.Clear();
+        }
+        base.Dispose(disposing);
+    }
+}
+
+#endregion
+
 /// <summary>
 /// Custom dropdown popup for history - uses a borderless Form for reliable display
 /// </summary>
@@ -739,6 +1695,7 @@ public class AddressBarForm : Form
     private readonly PictureBox _iconBox;
     private readonly Button _dropdownButton;
     private readonly HistoryDropdown _historyDropdown;
+    private AutoCompleteController _autoComplete;
     private readonly List<string> _history = new();
     private readonly Dictionary<string, Image?> _historyIcons = new();
     private CancellationTokenSource? _iconCts;
@@ -846,6 +1803,9 @@ public class AddressBarForm : Form
         _historyDropdown = new HistoryDropdown();
         _historyDropdown.ItemSelected += HistoryDropdown_ItemSelected;
 
+        // Explorer-style autocomplete (initialized in Load event after handle is created)
+        _autoComplete = null!;
+
         // Add icon to the appropriate parent based on settings
         if (_settings.IconPosition == IconPosition.Inside)
         {
@@ -876,6 +1836,13 @@ public class AddressBarForm : Form
         LayoutControls();
         _iconBox.Image = GetDefaultAppIcon();
         LoadHistory();
+
+        // Initialize autocomplete after form handle is created (timer needs message loop)
+        _autoComplete = new AutoCompleteController(_addressBox, _addressBoxContainer);
+        _autoComplete.DockAtBottom = _settings.DockPosition == DockPosition.Bottom;
+
+        // Preload common directories in background for instant autocomplete
+        _autoComplete.PreloadCommonPaths();
     }
 
     private void SetTextBoxMargins()
@@ -892,6 +1859,7 @@ public class AddressBarForm : Form
         _iconCts?.Cancel();
         _iconCts?.Dispose();
         _iconBox.Image?.Dispose();
+        _autoComplete.Dispose();
     }
 
     private void LayoutControls()
@@ -1110,9 +2078,18 @@ public class AddressBarForm : Form
 
     private void AddressBox_KeyDown(object? sender, KeyEventArgs e)
     {
+        // Let autocomplete handle keys first - if it handled the event, skip our handler
+        if (e.Handled) return;
+
         if (e.KeyCode == Keys.Enter)
         {
             e.SuppressKeyPress = true;
+            // Accept any selected text from auto-append
+            if (_addressBox.SelectionLength > 0)
+            {
+                _addressBox.SelectionStart = _addressBox.Text.Length;
+                _addressBox.SelectionLength = 0;
+            }
             Navigate();
         }
         else if (e.KeyCode == Keys.Escape)
@@ -1752,8 +2729,7 @@ public class AddressBarForm : Form
     private void HistoryDropdown_ItemSelected(object? sender, string path)
     {
         _addressBox.Text = path;
-        _addressBox.SelectAll();
-        _addressBox.Focus();
+        Navigate();
     }
 
     #endregion
