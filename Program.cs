@@ -32,6 +32,12 @@ public class AppSettings
     public IconPosition IconPosition { get; set; } = IconPosition.Inside;
     public bool RunAtStartup { get; set; } = false;
 
+    // Compact/floating mode settings
+    public bool IsFloating { get; set; } = false;
+    public int FloatingX { get; set; } = 100;
+    public int FloatingY { get; set; } = 100;
+    public int FloatingWidth { get; set; } = 400;
+
     private static readonly string SettingsDir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AddressBar");
     private static readonly string SettingsPath = Path.Combine(SettingsDir, "settings.json");
@@ -339,11 +345,25 @@ public class AddressBarManager : ApplicationContext
         contextMenu.Items.Add("Show", null, (s, e) => ShowAllBars());
         contextMenu.Items.Add("Hide", null, (s, e) => HideAllBars());
         contextMenu.Items.Add("-");
+
+        var floatItem = new ToolStripMenuItem(_settings.IsFloating ? "Dock to Edge" : "Undock (Compact Mode)");
+        floatItem.Click += (s, e) => ToggleFloatingMode();
+        contextMenu.Items.Add(floatItem);
+
+        contextMenu.Items.Add("-");
         contextMenu.Items.Add("Settings...", null, (s, e) => ShowSettings());
         contextMenu.Items.Add("-");
         contextMenu.Items.Add("Exit", null, (s, e) => Exit());
 
         _trayIcon.ContextMenuStrip = contextMenu;
+    }
+
+    public void ToggleFloatingMode()
+    {
+        _settings.IsFloating = !_settings.IsFloating;
+        _settings.Save();
+        RecreateAppBars();
+        BuildContextMenu(); // Update menu text
     }
 
     public void ShowSettings()
@@ -357,7 +377,15 @@ public class AddressBarManager : ApplicationContext
 
     private void CreateAppBars()
     {
-        if (_settings.MonitorMode == MonitorMode.All)
+        if (_settings.IsFloating)
+        {
+            // Create a single floating compact bar
+            var screen = Screen.PrimaryScreen!;
+            var bar = new AddressBarForm(screen, _settings, this);
+            bar.Show();
+            _bars.Add(bar);
+        }
+        else if (_settings.MonitorMode == MonitorMode.All)
         {
             foreach (var screen in Screen.AllScreens)
             {
@@ -1702,6 +1730,7 @@ public class AddressBarForm : Form
     private readonly Panel _addressBoxContainer;
     private readonly Button _goButton;
     private readonly Button _settingsButton;
+    private readonly Button _dockButton;
     private readonly Label _addressLabel;
     private readonly PictureBox _iconBox;
     private readonly Button _dropdownButton;
@@ -1713,6 +1742,12 @@ public class AddressBarForm : Form
     private static readonly HttpClient _httpClient = new() { Timeout = TimeSpan.FromSeconds(5) };
     private const string HistoryRegPath = @"Software\AddressBar\TypedPaths";
     private const int MaxHistoryItems = 25;
+
+    // Floating mode state
+    private bool _isDragging;
+    private Point _dragStartPoint;
+    private bool _isResizing;
+    private const int ResizeGripSize = 8;
 
     public AddressBarForm(Screen screen, AppSettings settings, AddressBarManager manager)
     {
@@ -1727,6 +1762,23 @@ public class AddressBarForm : Form
         BackColor = GetSystemBackColor();
 
         _appBarHeight = LogicalToDeviceUnits(_settings.BarHeight);
+
+        // Configure for floating mode
+        if (_settings.IsFloating)
+        {
+            // Floating window configuration
+            Location = new Point(_settings.FloatingX, _settings.FloatingY);
+            Size = new Size(_settings.FloatingWidth, _appBarHeight);
+            MinimumSize = new Size(200, _appBarHeight);
+            MaximumSize = new Size(800, _appBarHeight);
+
+            // Add resize cursor on edges
+            MouseDown += FloatingForm_MouseDown;
+            MouseMove += FloatingForm_MouseMove;
+            MouseUp += FloatingForm_MouseUp;
+            LocationChanged += FloatingForm_LocationChanged;
+            SizeChanged += FloatingForm_SizeChanged;
+        }
 
         ApplyDarkMode();
 
@@ -1784,11 +1836,29 @@ public class AddressBarForm : Form
         _settingsButton.FlatAppearance.BorderColor = GetBorderColor();
         _settingsButton.Click += SettingsButton_Click;
 
+        // Dock/Undock button - pin icon for floating, unpin for docked
+        _dockButton = new Button
+        {
+            Text = _settings.IsFloating ? "📌" : "📍",
+            FlatStyle = FlatStyle.Flat,
+            Font = new Font("Segoe UI", 9f),
+            BackColor = GetButtonBackColor(),
+            ForeColor = GetSystemForeColor(),
+            Cursor = Cursors.Hand,
+            Width = LogicalToDeviceUnits(30)
+        };
+        _dockButton.FlatAppearance.BorderSize = 1;
+        _dockButton.FlatAppearance.BorderColor = GetBorderColor();
+        _dockButton.Click += DockButton_Click;
+        // Tooltip to explain the button
+        var toolTip = new ToolTip();
+        toolTip.SetToolTip(_dockButton, _settings.IsFloating ? "Dock to screen edge" : "Undock to floating mode");
+
         _iconBox = new PictureBox
         {
             Size = new Size(16, 16),
             SizeMode = PictureBoxSizeMode.Zoom,
-            BackColor = _settings.IconPosition == IconPosition.Inside ? GetTextBoxBackColor() : GetSystemBackColor()
+            BackColor = (_settings.IconPosition == IconPosition.Inside || _settings.IsFloating) ? GetTextBoxBackColor() : GetSystemBackColor()
         };
 
         // Dropdown button - inside the container, no border, seamless with textbox
@@ -1818,7 +1888,8 @@ public class AddressBarForm : Form
         _autoComplete = null!;
 
         // Add icon to the appropriate parent based on settings
-        if (_settings.IconPosition == IconPosition.Inside)
+        // In floating mode, icon is always inside the container for compact layout
+        if (_settings.IconPosition == IconPosition.Inside || _settings.IsFloating)
         {
             _addressBoxContainer.Controls.Add(_iconBox);
         }
@@ -1832,6 +1903,7 @@ public class AddressBarForm : Form
         Controls.Add(_addressLabel);
         Controls.Add(_addressBoxContainer);
         Controls.Add(_goButton);
+        Controls.Add(_dockButton);
         Controls.Add(_settingsButton);
 
         SystemEvents.UserPreferenceChanged += SystemEvents_UserPreferenceChanged;
@@ -1842,7 +1914,11 @@ public class AddressBarForm : Form
 
     private void AddressBarForm_Load(object? sender, EventArgs e)
     {
-        RegisterAppBar();
+        if (!_settings.IsFloating)
+        {
+            RegisterAppBar();
+        }
+
         SetTextBoxMargins();
         LayoutControls();
         _iconBox.Image = GetDefaultAppIcon();
@@ -1850,7 +1926,7 @@ public class AddressBarForm : Form
 
         // Initialize autocomplete after form handle is created (timer needs message loop)
         _autoComplete = new AutoCompleteController(_addressBox, _addressBoxContainer);
-        _autoComplete.DockAtBottom = _settings.DockPosition == DockPosition.Bottom;
+        _autoComplete.DockAtBottom = _settings.DockPosition == DockPosition.Bottom && !_settings.IsFloating;
 
         // Preload common directories in background for instant autocomplete
         _autoComplete.PreloadCommonPaths();
@@ -1880,6 +1956,7 @@ public class AddressBarForm : Form
         int iconPadding = LogicalToDeviceUnits(4);
         int labelWidth = LogicalToDeviceUnits(50);
         int buttonWidth = _goButton.Width;
+        int dockWidth = _dockButton.Width;
         int settingsWidth = _settingsButton.Width;
         int dropdownWidth = _dropdownButton.Width;
 
@@ -1888,14 +1965,42 @@ public class AddressBarForm : Form
 
         _iconBox.Size = new Size(iconSize, iconSize);
 
-        if (_settings.IconPosition == IconPosition.Left)
+        // In floating mode, hide the "Address" label and show a smaller, more compact layout
+        bool isCompact = _settings.IsFloating;
+        _addressLabel.Visible = !isCompact;
+
+        int rightButtonsWidth = buttonWidth + dockWidth + settingsWidth + padding * 4;
+
+        if (isCompact)
+        {
+            // Compact floating mode - no label, icon inside, more compact
+            int textBoxLeft = padding;
+            int textBoxWidth = Width - textBoxLeft - rightButtonsWidth;
+
+            _addressBoxContainer.Location = new Point(textBoxLeft, controlsY);
+            _addressBoxContainer.Size = new Size(textBoxWidth, containerHeight);
+
+            // Icon inside container, on the left
+            _iconBox.Location = new Point(4, (containerHeight - iconSize - 2) / 2);
+
+            // Dropdown button on the right inside container
+            _dropdownButton.Height = containerHeight - 2;
+            _dropdownButton.Location = new Point(textBoxWidth - dropdownWidth - 1, 0);
+
+            // Textbox after the icon inside container, leaving room for dropdown
+            int textBoxY = (containerHeight - _addressBox.PreferredHeight - 2) / 2;
+            int textBoxInternalLeft = iconSize + iconPadding + 4;
+            _addressBox.Location = new Point(textBoxInternalLeft, textBoxY);
+            _addressBox.Width = textBoxWidth - textBoxInternalLeft - dropdownWidth - 6;
+        }
+        else if (_settings.IconPosition == IconPosition.Left)
         {
             // Icon on the left, then label, then address box
             _iconBox.Location = new Point(padding, (Height - iconSize) / 2);
             _addressLabel.Location = new Point(padding + iconSize + iconPadding, (Height - _addressLabel.Height) / 2);
 
             int textBoxLeft = padding + iconSize + iconPadding + labelWidth;
-            int textBoxWidth = Width - textBoxLeft - buttonWidth - settingsWidth - padding * 3;
+            int textBoxWidth = Width - textBoxLeft - rightButtonsWidth;
 
             _addressBoxContainer.Location = new Point(textBoxLeft, controlsY);
             _addressBoxContainer.Size = new Size(textBoxWidth, containerHeight);
@@ -1915,7 +2020,7 @@ public class AddressBarForm : Form
             _addressLabel.Location = new Point(padding, (Height - _addressLabel.Height) / 2);
 
             int textBoxLeft = padding + labelWidth;
-            int textBoxWidth = Width - textBoxLeft - buttonWidth - settingsWidth - padding * 3;
+            int textBoxWidth = Width - textBoxLeft - rightButtonsWidth;
 
             _addressBoxContainer.Location = new Point(textBoxLeft, controlsY);
             _addressBoxContainer.Size = new Size(textBoxWidth, containerHeight);
@@ -1934,8 +2039,11 @@ public class AddressBarForm : Form
             _addressBox.Width = textBoxWidth - textBoxInternalLeft - dropdownWidth - 6;
         }
 
-        _goButton.Location = new Point(Width - buttonWidth - settingsWidth - padding * 2, controlsY);
+        _goButton.Location = new Point(Width - buttonWidth - dockWidth - settingsWidth - padding * 3, controlsY);
         _goButton.Height = containerHeight;
+
+        _dockButton.Location = new Point(Width - dockWidth - settingsWidth - padding * 2, controlsY);
+        _dockButton.Height = containerHeight;
 
         _settingsButton.Location = new Point(Width - settingsWidth - padding, controlsY);
         _settingsButton.Height = containerHeight;
@@ -2126,6 +2234,111 @@ public class AddressBarForm : Form
         _manager.ShowSettings();
     }
 
+    private void DockButton_Click(object? sender, EventArgs e)
+    {
+        _manager.ToggleFloatingMode();
+    }
+
+    #region Floating Mode
+
+    private void FloatingForm_MouseDown(object? sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left) return;
+
+        // Check if we're on the resize grip (right edge)
+        if (e.X >= Width - ResizeGripSize)
+        {
+            _isResizing = true;
+        }
+        else
+        {
+            // Start dragging
+            _isDragging = true;
+            _dragStartPoint = e.Location;
+        }
+    }
+
+    private void FloatingForm_MouseMove(object? sender, MouseEventArgs e)
+    {
+        // Update cursor based on position
+        if (e.X >= Width - ResizeGripSize)
+        {
+            Cursor = Cursors.SizeWE;
+        }
+        else if (!_isResizing)
+        {
+            Cursor = Cursors.SizeAll;
+        }
+
+        if (_isDragging)
+        {
+            // Move the window
+            var screenPoint = PointToScreen(e.Location);
+            Location = new Point(screenPoint.X - _dragStartPoint.X, screenPoint.Y - _dragStartPoint.Y);
+        }
+        else if (_isResizing)
+        {
+            // Resize the window (only width)
+            int newWidth = Math.Max(MinimumSize.Width, Math.Min(MaximumSize.Width, e.X + ResizeGripSize));
+            Width = newWidth;
+        }
+    }
+
+    private void FloatingForm_MouseUp(object? sender, MouseEventArgs e)
+    {
+        _isDragging = false;
+        _isResizing = false;
+    }
+
+    private void FloatingForm_LocationChanged(object? sender, EventArgs e)
+    {
+        if (_settings.IsFloating && !_isDragging)
+        {
+            // Save position when dragging stops (debounced by checking _isDragging)
+            return;
+        }
+
+        if (_settings.IsFloating)
+        {
+            _settings.FloatingX = Location.X;
+            _settings.FloatingY = Location.Y;
+            // Save is debounced - we'll save on mouse up
+        }
+    }
+
+    private void FloatingForm_SizeChanged(object? sender, EventArgs e)
+    {
+        if (_settings.IsFloating)
+        {
+            _settings.FloatingWidth = Width;
+        }
+    }
+
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        base.OnMouseUp(e);
+
+        // Save settings when dragging/resizing ends
+        if (_settings.IsFloating && (_isDragging || _isResizing))
+        {
+            _settings.Save();
+        }
+
+        _isDragging = false;
+        _isResizing = false;
+    }
+
+    protected override void OnMouseLeave(EventArgs e)
+    {
+        base.OnMouseLeave(e);
+        if (!_isDragging && !_isResizing)
+        {
+            Cursor = Cursors.Default;
+        }
+    }
+
+    #endregion
+
     private void Navigate()
     {
         string input = _addressBox.Text.Trim();
@@ -2243,7 +2456,7 @@ public class AddressBarForm : Form
         _addressBox.BackColor = GetTextBoxBackColor();
         _addressBox.ForeColor = GetSystemForeColor();
         _addressBoxContainer.BackColor = GetTextBoxBackColor();
-        _iconBox.BackColor = _settings.IconPosition == IconPosition.Inside ? GetTextBoxBackColor() : GetSystemBackColor();
+        _iconBox.BackColor = _settings.IconPosition == IconPosition.Inside || _settings.IsFloating ? GetTextBoxBackColor() : GetSystemBackColor();
         _dropdownButton.BackColor = GetTextBoxBackColor();
         _dropdownButton.ForeColor = GetSystemForeColor();
         _dropdownButton.FlatAppearance.BorderColor = GetTextBoxBackColor();
@@ -2252,6 +2465,9 @@ public class AddressBarForm : Form
         _goButton.BackColor = GetButtonBackColor();
         _goButton.ForeColor = GetSystemForeColor();
         _goButton.FlatAppearance.BorderColor = GetBorderColor();
+        _dockButton.BackColor = GetButtonBackColor();
+        _dockButton.ForeColor = GetSystemForeColor();
+        _dockButton.FlatAppearance.BorderColor = GetBorderColor();
         _settingsButton.BackColor = GetButtonBackColor();
         _settingsButton.ForeColor = GetSystemForeColor();
         _settingsButton.FlatAppearance.BorderColor = GetBorderColor();
