@@ -2054,11 +2054,17 @@ public class AddressBarForm : Form
                     _isFullScreen = m.LParam.ToInt32() != 0;
                     if (_isFullScreen)
                     {
+                        // Fullscreen app detected - hide the bar but keep it registered
+                        // so we continue receiving notifications
+                        Hide();
                         TopMost = false;
                     }
                     else
                     {
+                        // Fullscreen app closed - restore the bar
+                        Show();
                         TopMost = true;
+                        SetAppBarPos();
                         SetWindowPos(Handle, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                     }
                     break;
