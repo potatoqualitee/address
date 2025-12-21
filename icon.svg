@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- Clean flat background with XP blue -->
+  <rect width="256" height="256" rx="32" fill="#2878b8"/>
+
+  <!-- Modern minimal bar -->
+  <rect x="24" y="96" width="208" height="64" rx="32" fill="#ffffff"/>
+
+  <!-- XP Green Go button - modernized -->
+  <circle cx="196" cy="128" r="28" fill="#5eb030"/>
+
+  <!-- Clean arrow -->
+  <path d="M186 128 L204 128 M196 118 L206 128 L196 138" stroke="#ffffff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+
+  <!-- Minimal URL hint -->
+  <rect x="48" y="120" width="80" height="16" rx="8" fill="#e8e8e8"/>
+</svg>
