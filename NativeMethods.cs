@@ -63,6 +63,7 @@ internal static class NativeMethods
     public const uint SWP_NOSIZE = 0x0001;
 
     public const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
+    public const int DWMWA_EXCLUDED_FROM_PEEK = 12;
 
     public const int EM_SETMARGINS = 0xD3;
     public const int EC_LEFTMARGIN = 0x1;

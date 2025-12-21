@@ -197,6 +197,11 @@ public class AddressBarForm : Form
 
     private void AddressBarForm_Load(object? sender, EventArgs e)
     {
+        // Exclude from Aero Peek so the bar stays visible when hovering taskbar previews
+        int excludeFromPeek = 1;
+        NativeMethods.DwmSetWindowAttribute(Handle, NativeMethods.DWMWA_EXCLUDED_FROM_PEEK,
+            ref excludeFromPeek, sizeof(int));
+
         if (!_settings.IsFloating)
         {
             RegisterAppBar();
