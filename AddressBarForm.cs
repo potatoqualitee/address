@@ -787,6 +787,7 @@ public class AddressBarForm : Form
             {
                 string command = parts[0];
                 var exePath = FindExecutableInPath(command);
+                File.AppendAllText(@"C:\temp\addressbar_debug.log", $"[{DateTime.Now}] Command: '{command}' -> ExePath: '{exePath}'\n");
                 if (exePath != null)
                 {
                     return GetFileIcon(exePath, isDirectory: false);
@@ -825,15 +826,32 @@ public class AddressBarForm : Form
 
     private static string? FindExecutableInPath(string name)
     {
-        string fileName = name;
-        if (!Path.HasExtension(fileName))
+        // Get executable extensions from PATHEXT (or use defaults)
+        var pathExtEnv = Environment.GetEnvironmentVariable("PATHEXT") ?? ".COM;.EXE;.BAT;.CMD";
+        var extensions = pathExtEnv.Split(';', StringSplitOptions.RemoveEmptyEntries);
+
+        // Build list of filenames to search for
+        var fileNames = new List<string>();
+        if (Path.HasExtension(name))
         {
-            fileName += ".exe";
+            fileNames.Add(name);
+        }
+        else
+        {
+            // Add each extension variant
+            foreach (var ext in extensions)
+            {
+                fileNames.Add(name + ext);
+            }
         }
 
-        if (File.Exists(fileName))
+        // Check current directory first
+        foreach (var fileName in fileNames)
         {
-            return Path.GetFullPath(fileName);
+            if (File.Exists(fileName))
+            {
+                return Path.GetFullPath(fileName);
+            }
         }
 
         var pathEnv = Environment.GetEnvironmentVariable("PATH");
@@ -843,25 +861,123 @@ public class AddressBarForm : Form
         var paths = pathEnv.Split(Path.PathSeparator);
         foreach (var dir in paths)
         {
-            try
+            foreach (var fileName in fileNames)
             {
-                var fullPath = Path.Combine(dir, fileName);
-                if (File.Exists(fullPath))
+                try
                 {
-                    return fullPath;
+                    var fullPath = Path.Combine(dir, fileName);
+                    if (File.Exists(fullPath))
+                    {
+                        return fullPath;
+                    }
                 }
+                catch { }
             }
-            catch { }
         }
 
         var winDir = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
-        var winPath = Path.Combine(winDir, fileName);
-        if (File.Exists(winPath))
-            return winPath;
+        foreach (var fileName in fileNames)
+        {
+            var winPath = Path.Combine(winDir, fileName);
+            if (File.Exists(winPath))
+                return winPath;
 
-        var sys32Path = Path.Combine(winDir, "System32", fileName);
-        if (File.Exists(sys32Path))
-            return sys32Path;
+            var sys32Path = Path.Combine(winDir, "System32", fileName);
+            if (File.Exists(sys32Path))
+                return sys32Path;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Parses a .cmd or .bat wrapper script to find the actual executable it wraps.
+    /// Many apps (VS Code, npm, etc.) install wrapper scripts that call the real .exe.
+    /// </summary>
+    private static string? TryGetWrappedExecutable(string scriptPath)
+    {
+        try
+        {
+            var scriptDir = Path.GetDirectoryName(scriptPath) ?? "";
+            var lines = File.ReadAllLines(scriptPath);
+            var variables = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var rawLine in lines)
+            {
+                var line = rawLine.Trim();
+
+                // Parse SET statements: SET "VAR=value" or SET VAR=value
+                if (line.StartsWith("SET ", StringComparison.OrdinalIgnoreCase))
+                {
+                    var setContent = line.Substring(4).Trim();
+                    if (setContent.StartsWith("\"") && setContent.EndsWith("\""))
+                        setContent = setContent.Substring(1, setContent.Length - 2);
+
+                    var eqIdx = setContent.IndexOf('=');
+                    if (eqIdx > 0)
+                    {
+                        var varName = setContent.Substring(0, eqIdx).Trim();
+                        var varValue = setContent.Substring(eqIdx + 1).Trim();
+                        variables[varName] = varValue;
+                    }
+                }
+
+                // Look for .exe references in the line
+                if (line.Contains(".exe", StringComparison.OrdinalIgnoreCase))
+                {
+                    var exePath = ExtractExePathFromLine(line, scriptDir, variables);
+                    if (exePath != null && File.Exists(exePath))
+                        return exePath;
+                }
+            }
+        }
+        catch { }
+
+        return null;
+    }
+
+    private static string? ExtractExePathFromLine(string line, string scriptDir, Dictionary<string, string> variables)
+    {
+        // Expand %~dp0 (directory of the script)
+        var expanded = line.Replace("%~dp0", scriptDir + Path.DirectorySeparatorChar);
+
+        // Expand known variables
+        foreach (var kvp in variables)
+        {
+            var expandedValue = kvp.Value.Replace("%~dp0", scriptDir + Path.DirectorySeparatorChar);
+            expanded = expanded.Replace($"%{kvp.Key}%", expandedValue, StringComparison.OrdinalIgnoreCase);
+        }
+
+        // Try to extract a path ending in .exe
+        // Pattern: quoted path like "path\to\file.exe" or unquoted path\to\file.exe
+        var patterns = new[]
+        {
+            @"""([^""]+\.exe)""",  // Quoted path
+            @"(\S+\.exe)",          // Unquoted path (no spaces)
+        };
+
+        foreach (var pattern in patterns)
+        {
+            var match = System.Text.RegularExpressions.Regex.Match(expanded, pattern,
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (match.Success)
+            {
+                var candidate = match.Groups[1].Value;
+                try
+                {
+                    // Normalize the path
+                    if (!Path.IsPathRooted(candidate))
+                    {
+                        candidate = Path.GetFullPath(Path.Combine(scriptDir, candidate));
+                    }
+                    candidate = Path.GetFullPath(candidate); // Resolve .. etc.
+
+                    if (File.Exists(candidate))
+                        return candidate;
+                }
+                catch { }
+            }
+        }
 
         return null;
     }
@@ -873,6 +989,23 @@ public class AddressBarForm : Form
             if (!Path.IsPathRooted(path))
             {
                 path = Path.GetFullPath(path);
+            }
+
+            // For wrapper scripts (.cmd, .bat), try to find the actual executable they wrap
+            if (!isDirectory && File.Exists(path))
+            {
+                var ext = Path.GetExtension(path).ToLowerInvariant();
+                File.AppendAllText(@"C:\temp\addressbar_debug.log", $"[{DateTime.Now}] GetFileIcon path: '{path}', ext: '{ext}'\n");
+                if (ext == ".cmd" || ext == ".bat")
+                {
+                    var wrappedExe = TryGetWrappedExecutable(path);
+                    File.AppendAllText(@"C:\temp\addressbar_debug.log", $"[{DateTime.Now}] WrappedExe: '{wrappedExe}'\n");
+                    if (wrappedExe != null && File.Exists(wrappedExe))
+                    {
+                        File.AppendAllText(@"C:\temp\addressbar_debug.log", $"[{DateTime.Now}] Using wrapped exe: '{wrappedExe}'\n");
+                        path = wrappedExe;
+                    }
+                }
             }
 
             bool exists = isDirectory ? Directory.Exists(path) : File.Exists(path);
