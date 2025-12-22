@@ -779,15 +779,30 @@ public class AddressBarForm : Form
             }
         }
 
+        // Check for command with arguments (e.g., "notepad C:\github\")
+        if (input.Contains(' '))
+        {
+            string[] parts = input.Split(' ', 2, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length >= 1)
+            {
+                string command = parts[0];
+                var exePath = FindExecutableInPath(command);
+                if (exePath != null)
+                {
+                    return GetFileIcon(exePath, isDirectory: false);
+                }
+            }
+        }
+
         if (input.Contains('\\'))
         {
             return GetFileIcon(expanded, isDirectory: false);
         }
 
-        var exePath = FindExecutableInPath(input);
-        if (exePath != null)
+        var exePathSimple = FindExecutableInPath(input);
+        if (exePathSimple != null)
         {
-            return GetFileIcon(exePath, isDirectory: false);
+            return GetFileIcon(exePathSimple, isDirectory: false);
         }
 
         return null;

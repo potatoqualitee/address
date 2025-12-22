@@ -255,8 +255,28 @@ public class AutoCompleteController : IDisposable
         _enumCts = new CancellationTokenSource();
         var token = _enumCts.Token;
 
-        bool isPath = text.Contains('\\') || text.Contains('/') ||
-                      (text.Length >= 2 && text[1] == ':');
+        // Extract path portion if there's a command prefix (e.g., "notepad C:\github\")
+        string pathPortion = text;
+        string commandPrefix = "";
+
+        if (text.Contains(' '))
+        {
+            int spaceIndex = text.IndexOf(' ');
+            string possibleCommand = text.Substring(0, spaceIndex);
+            string afterSpace = text.Substring(spaceIndex + 1);
+
+            // Check if the part after the space looks like a path
+            if (afterSpace.Length > 0 &&
+                (afterSpace.Contains('\\') || afterSpace.Contains('/') ||
+                 (afterSpace.Length >= 2 && afterSpace[1] == ':')))
+            {
+                commandPrefix = text.Substring(0, spaceIndex + 1);
+                pathPortion = afterSpace;
+            }
+        }
+
+        bool isPath = pathPortion.Contains('\\') || pathPortion.Contains('/') ||
+                      (pathPortion.Length >= 2 && pathPortion[1] == ':');
 
         if (!isPath)
         {
@@ -264,7 +284,7 @@ public class AutoCompleteController : IDisposable
             return;
         }
 
-        string prefix = GetDirectoryPrefix(text);
+        string prefix = GetDirectoryPrefix(pathPortion);
 
         List<string>? cachedItems = null;
         lock (_cacheLock)
@@ -277,14 +297,16 @@ public class AutoCompleteController : IDisposable
 
         if (cachedItems != null)
         {
-            FilterAndShowResults(text, cachedItems);
+            FilterAndShowResults(text, cachedItems, commandPrefix, pathPortion);
         }
         else
         {
             var capturedPrefix = prefix;
             var capturedText = text;
+            var capturedCommandPrefix = commandPrefix;
+            var capturedPathPortion = pathPortion;
 
-            _enumThread = new Thread(() => EnumerateDirectory(capturedPrefix, capturedText, token))
+            _enumThread = new Thread(() => EnumerateDirectory(capturedPrefix, capturedText, capturedCommandPrefix, capturedPathPortion, token))
             {
                 IsBackground = true,
                 Priority = ThreadPriority.BelowNormal
@@ -310,7 +332,7 @@ public class AutoCompleteController : IDisposable
         return text;
     }
 
-    private void EnumerateDirectory(string prefix, string originalText, CancellationToken token)
+    private void EnumerateDirectory(string prefix, string originalText, string commandPrefix, string pathPortion, CancellationToken token)
     {
         var items = new List<string>();
         int batchCount = 0;
@@ -336,7 +358,7 @@ public class AutoCompleteController : IDisposable
 
                         if (batchCount == BatchSize)
                         {
-                            SendPartialResults(originalText, items, token);
+                            SendPartialResults(originalText, items, commandPrefix, pathPortion, token);
                         }
                     }
                 }
@@ -389,13 +411,13 @@ public class AutoCompleteController : IDisposable
             {
                 if (!token.IsCancellationRequested)
                 {
-                    FilterAndShowResults(originalText, items);
+                    FilterAndShowResults(originalText, items, commandPrefix, pathPortion);
                 }
             });
         }
     }
 
-    private void SendPartialResults(string text, List<string> items, CancellationToken token)
+    private void SendPartialResults(string text, List<string> items, string commandPrefix, string pathPortion, CancellationToken token)
     {
         if (token.IsCancellationRequested) return;
         if (!_textBox.IsHandleCreated || _textBox.IsDisposed) return;
@@ -406,30 +428,40 @@ public class AutoCompleteController : IDisposable
         {
             if (!token.IsCancellationRequested)
             {
-                FilterAndShowResults(text, itemsCopy);
+                FilterAndShowResults(text, itemsCopy, commandPrefix, pathPortion);
             }
         });
     }
 
-    private void FilterAndShowResults(string text, List<string> items)
+    private void FilterAndShowResults(string text, List<string> items, string commandPrefix, string pathPortion)
     {
+        // Filter based on the path portion only
         var filtered = items
-            .Where(item => item.StartsWith(text, StringComparison.OrdinalIgnoreCase))
+            .Where(item => item.StartsWith(pathPortion, StringComparison.OrdinalIgnoreCase))
             .OrderBy(item => item, StringComparer.OrdinalIgnoreCase)
             .Take(15)
             .ToList();
 
-        _currentItems = filtered;
+        // If there's a command prefix, prepend it to the filtered items
+        if (!string.IsNullOrEmpty(commandPrefix))
+        {
+            _currentItems = filtered.Select(item => commandPrefix + item).ToList();
+        }
+        else
+        {
+            _currentItems = filtered;
+        }
+
         _selectedIndex = -1;
 
-        if (filtered.Count == 0)
+        if (_currentItems.Count == 0)
         {
             HideDropdown();
             return;
         }
 
         ShowDropdown();
-        _dropdown.SetItems(filtered);
+        _dropdown.SetItems(_currentItems);
     }
 
     private void ShowDropdown()
