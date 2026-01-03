@@ -24,6 +24,7 @@
   <ItemGroup>
     <Content Include="addressbar.ico">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
     </Content>
   </ItemGroup>
 
